@@ -1,0 +1,21 @@
+# environments and tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.claude/
+.DS_Store
+
+# local state: ledger DBs, library scans, spike outputs and logs (personal data, regenerable)
+data/
+m1/data/
+spikes/out/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# secrets never live in this repo; they come from ~/.claude-secrets/credentials.env
+*.env
+*token*.json
+cookies.txt
