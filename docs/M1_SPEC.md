@@ -155,6 +155,7 @@ Env: `CADENCE_DB` (default `data/cadence.db`), `CADENCE_TIDAL_TOKEN` (default `~
 - `link [--artist NAME] [--rematch]`
 - `report [--artist NAME] [--json]`
 - `artist set-tidal NAME TIDAL_ID` (sets `manual`)
+- `alias add ALIAS TARGET [--note TEXT]` / `alias list` / `alias remove ALIAS` (migration `003_alias.sql`, `catalog/alias.py`): for tags that are another name for an artist already in the ledger ("Bill Evans Trio" -> "Bill Evans"). `add` stores `artist_alias(alias_norm -> artist_id)`, then points every file whose album-artist tag (else artist tag) normalizes to the alias at TARGET; a moved file's `recording_id`/`match` is reset to `unmatched` (never for `manual`), so run `cadence link` afterwards. `import-legacy` resolves aliases before artist names, so re-imports keep the mapping. `add` refuses an unknown TARGET, an alias equal to TARGET's own name, and an alias that is itself an artist with a resolved Tidal id (`tidal_match` `auto`/`manual`; an `ambiguous` artist's provisional id doesn't count). `remove` only deletes the mapping: files stay with TARGET until `import-legacy` is re-run. One alias maps to one artist, so a collab tag ("TV Girl, George Clanton") credits only TARGET.
 - `gate-status`
 
 ### Acceptance test (`tests/test_will_paquin_e2e.py`)

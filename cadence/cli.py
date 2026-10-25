@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from cadence import report
+from cadence.catalog.alias import add_alias, list_aliases, remove_alias
 from cadence.catalog.candidates import format_result, pending_artists, run_candidates
 from cadence.catalog.groups import regroup_all, regroup_artist
 from cadence.catalog.link import link_files
@@ -228,6 +229,37 @@ def cmd_set_tidal(args, conn) -> int:
     return 0
 
 
+def cmd_alias_add(args, conn) -> int:
+    r = add_alias(conn, args.alias, args.target, args.note)
+    if "error" in r:
+        conn.rollback()
+        print(f"alias add: {r['error']}", file=sys.stderr)
+        return 1
+    conn.commit()
+    print(f"alias: '{r['alias']}' -> {r['artist']}: {r['files']} file(s) tagged so, {r['reset']} link(s) reset"
+          + ("; run `cadence link`" if r["reset"] else ""))
+    return 0
+
+
+def cmd_alias_list(args, conn) -> int:
+    rows = list_aliases(conn)
+    for r in rows:
+        print(f"{r['alias_norm']} -> {r['artist']}" + (f"  ({r['note']})" if r["note"] else ""))
+    if not rows:
+        print("alias: none")
+    return 0
+
+
+def cmd_alias_remove(args, conn) -> int:
+    r = remove_alias(conn, args.alias)
+    if "error" in r:
+        print(f"alias remove: {r['error']}", file=sys.stderr)
+        return 1
+    conn.commit()
+    print(f"alias: '{r['alias']}' removed; its files stay with {r['artist']} until `cadence import-legacy` is re-run")
+    return 0
+
+
 def cmd_gate_status(args, conn) -> int:
     until = _gate(conn).paused_until()
     print(f"tidal gate: paused until {until.isoformat()}" if until else "tidal gate: open")
@@ -297,6 +329,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("name")
     s.add_argument("tidal_id", type=int)
     s.set_defaults(fn=cmd_set_tidal)
+
+    al = sub.add_parser("alias", help="treat a tag name as another name for an artist").add_subparsers(
+        dest="sub", required=True)
+    s = al.add_parser("add", help="files tagged ALIAS belong to TARGET")
+    s.add_argument("alias")
+    s.add_argument("target")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_alias_add)
+    al.add_parser("list", help="show aliases").set_defaults(fn=cmd_alias_list)
+    s = al.add_parser("remove", help="forget an alias")
+    s.add_argument("alias")
+    s.set_defaults(fn=cmd_alias_remove)
 
     sub.add_parser("gate-status", help="show whether the Tidal gate is paused").set_defaults(fn=cmd_gate_status)
     return p

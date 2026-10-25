@@ -6,7 +6,8 @@ import pytest
 from cadence.ledger import db
 
 TABLES = {"artist", "release", "release_source", "recording", "track", "file", "want", "suggestion",
-          "job", "event_log", "catalog_cache", "setting", "card", "card_state", "schema_version"}
+          "job", "event_log", "catalog_cache", "setting", "card", "card_state", "schema_version",
+          "artist_alias"}
 
 
 def mem():
@@ -17,11 +18,11 @@ def mem():
 
 def test_migrate_creates_schema_and_is_idempotent():
     conn = db.connect(":memory:")
-    assert db.migrate(conn) == [1, 2]
+    assert db.migrate(conn) == [1, 2, 3]
     assert db.migrate(conn) == []
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert TABLES <= names
-    assert [r["version"] for r in conn.execute("SELECT version FROM schema_version")] == [1, 2]
+    assert [r["version"] for r in conn.execute("SELECT version FROM schema_version")] == [1, 2, 3]
 
 
 def test_connect_pragmas_and_row_factory():

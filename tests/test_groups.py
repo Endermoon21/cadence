@@ -70,7 +70,7 @@ def test_migration_002_applies_to_a_database_that_already_has_data(tmp_path):
     conn.execute("INSERT INTO recording(artist_id, title, norm_title, duration_s) VALUES (1, 't', 't', 100)")
     conn.execute("INSERT INTO release(artist_id, title, norm_title, type) VALUES (1, 'T', 't', 'album')")
     conn.commit()
-    assert db.migrate(conn) == [2]
+    assert db.migrate(conn) == [2, 3]
     assert conn.execute("SELECT canon_id FROM recording").fetchone()[0] is None
     assert report.artist_report(conn, 1)["recordings_total"] == 0          # NULL canon_id / group_key are fine
     regroup_all(conn)

@@ -36,7 +36,8 @@ def _artist_id(conn: sqlite3.Connection, row: dict, stats: dict) -> int | None:
     if not norm:
         stats["files_without_artist"] += 1
         return None
-    found = conn.execute("SELECT id FROM artist WHERE norm_name = ?", (norm,)).fetchone()
+    found = conn.execute("SELECT artist_id FROM artist_alias WHERE alias_norm = ?", (norm,)).fetchone() \
+        or conn.execute("SELECT id FROM artist WHERE norm_name = ?", (norm,)).fetchone()
     if found:
         return found[0]
     stats["artists_created"] += 1
