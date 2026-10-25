@@ -94,3 +94,53 @@ def test_deluxe_edition_is_not_an_edit():
 def test_unbalanced_suffix_not_peeled():
     # the dash is inside the parentheses: one group, not a trailing suffix
     assert norm_title("Song (Live - Remastered)") == "song [live remastered]"
+
+
+# ---------------------------------------------------------------- edition wording (release titles only)
+
+@pytest.mark.parametrize("title,expected", [
+    ("Grace (Legacy Edition)", "grace"),
+    ("Hysteria (Expanded Edition)", "hysteria"),
+    ("Boss Horn (Rudy Van Gelder Edition)", "boss horn"),
+    ("Blue Train (Collector's Edition)", "blue train"),
+    ("Waltz For Debby (Original Jazz Classics Remasters)", "waltz for debby"),
+    ("Favourite Worst Nightmare (Standard Version)", "favourite worst nightmare"),
+    ("Aventine (Bonus Track Version)", "aventine"),
+    ("Aventine [Bonus Tracks]", "aventine"),
+    ("Blue Train (Remastered 2003/Rudy Van Gelder Edition)", "blue train"),
+    ("Diamond Star Halos (With Commentary)", "diamond star halos"),   # a "with ..." group is dropped as before
+])
+def test_release_edition_words_are_neutral(title, expected):
+    assert split_title(title, release=True).base == expected
+    assert split_title(title, release=True).variant is None
+
+
+def test_release_edition_flags():
+    assert split_title("Grace (Legacy Edition)", release=True).flags == {"edition"}
+    assert split_title("X (Original Jazz Classics Remasters)", release=True).flags == {"remaster"}
+    assert split_title("X (Standard Version)", release=True).flags == {"neutral"}
+    assert split_title("X", "Remastered 2003/Rudy Van Gelder Edition", release=True).base == "x"
+
+
+@pytest.mark.parametrize("title,variant", [
+    ("Song (Piano Version)", "piano"),
+    ("Album (Live Edition)", "live edition"),
+    ("Album (Remix Edition)", "remix edition"),
+    ("Album (Live) (Legacy Edition)", "live"),
+])
+def test_variant_words_beat_edition_words(title, variant):
+    assert split_title(title, release=True).variant == variant
+
+
+def test_bare_version_groups_are_not_neutral():
+    assert split_title("Song (Radio Version)", release=True).base == "song radio version"
+    assert split_title("Song (Piano Version)", release=True).variant == "piano"
+    assert split_title("Song (Single Version)", release=True).base == "song"       # existing rule
+
+
+def test_track_titles_keep_edition_wording():
+    # "Drumless Edition" and "Edition I / Pt. 1" identify different recordings; only release titles drop them
+    assert norm_title("Touch (Drumless Edition)") == "touch drumless edition"
+    assert norm_title("Ascension (Edition I / Pt. 1)") == "ascension edition i pt 1"
+    assert norm_title("Grace (Legacy Edition)") == "grace legacy edition"
+    assert split_title("Diamond Star Halos (With Commentary)").base == "diamond star halos"

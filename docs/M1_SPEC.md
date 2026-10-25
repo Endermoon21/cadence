@@ -151,6 +151,7 @@ Env: `CADENCE_DB` (default `data/cadence.db`), `CADENCE_TIDAL_TOKEN` (default `~
 - `init` -> migrate
 - `import-legacy PATH`
 - `sync-catalog [--artist NAME]... [--all] [--max-calls 400] [--interval 2.0] [--burst 3] [--force]` (prints one line per artist; exit code 3 if paused; the gate persists its pause in `setting`)
+- `candidates [--artist NAME]... [--max-calls 150] [--interval 2.0] [--burst 3] [--json]`: helps resolve `tidal_match='ambiguous'` artists (all of them, or only the named ones). For each stored candidate profile it fetches the release listing (`artist_releases` only: same gate, call budget and `tidal:releases:{id}` cache as `sync-catalog`; never tracks) and compares the release titles with the albums the artist's library files are tagged with (`split_title(...).base`, so remaster/deluxe tags don't matter). One line per candidate, best first: release count, library albums and files matched, example titles, the tidal.com link. It prints `-> suggest: cadence artist set-tidal "NAME" ID` only when one candidate has the most matched files and leads the runner-up by >= 2 files or 1 album (and its id isn't already another artist's); otherwise `-> no clear winner, check the links`. Read-only: it never applies a choice. No ambiguous artists means exit 0 before login; a paused gate exits 3 (partial output, no suggestion for the artist it stopped on); a rejected login exits 1.
 - `link [--artist NAME] [--rematch]`
 - `report [--artist NAME] [--json]`
 - `artist set-tidal NAME TIDAL_ID` (sets `manual`)

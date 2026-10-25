@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 from cadence import report
+from cadence.catalog.candidates import format_result, pending_artists, run_candidates
+from cadence.catalog.groups import regroup_all, regroup_artist
 from cadence.catalog.link import link_files
 from cadence.catalog.sync import clear_cache, pending_work, sync_all
 from cadence.gate.bucket import Gate, GatePaused
@@ -73,6 +75,25 @@ def _login(gate: Gate, token: str):
     return gate.call(load_session, token)
 
 
+def _tidal_catalog(conn, args, cmd: str):
+    """(catalog, None) once logged in, or (None, exit code) when the gate is paused or the login fails."""
+    gate = _gate(conn, args.interval, args.burst)
+    until = gate.paused_until()
+    if until:
+        print(f"gate paused until {until.isoformat()}; not touching Tidal")
+        return None, EXIT_PAUSED
+    from cadence.sources.tidal import CatalogCache, TidalCatalog  # imports tidalapi
+    token = os.path.expanduser(os.environ.get("CADENCE_TIDAL_TOKEN", "~/.config/tidal_dl_ng/token.json"))
+    try:
+        return TidalCatalog(_login(gate, token), gate, CatalogCache(conn), args.max_calls), None
+    except GatePaused as p:
+        print(f"gate paused until {p.until.isoformat()}: {p.reason}")
+        return None, EXIT_PAUSED
+    except Exception as exc:
+        print(f"{cmd}: cannot start Tidal session: {exc}", file=sys.stderr)
+        return None, 1
+
+
 def cmd_sync_catalog(args, conn) -> int:
     if not args.all and not args.artist:
         print("sync-catalog: give --artist NAME (repeatable) or --all", file=sys.stderr)
@@ -84,21 +105,9 @@ def cmd_sync_catalog(args, conn) -> int:
         print(f"sync-catalog: nothing due ({work['skipped']} synced within 7 days, {work['ambiguous']} "
               f"ambiguous, {work['unresolved']} unresolved); not contacting Tidal")
         return 0
-    gate = _gate(conn, args.interval, args.burst)
-    until = gate.paused_until()
-    if until:
-        print(f"gate paused until {until.isoformat()}; not touching Tidal")
-        return EXIT_PAUSED
-    from cadence.sources.tidal import CatalogCache, TidalCatalog  # imports tidalapi
-    token = os.path.expanduser(os.environ.get("CADENCE_TIDAL_TOKEN", "~/.config/tidal_dl_ng/token.json"))
-    try:
-        catalog = TidalCatalog(_login(gate, token), gate, CatalogCache(conn), args.max_calls)
-    except GatePaused as p:
-        print(f"gate paused until {p.until.isoformat()}: {p.reason}")
-        return EXIT_PAUSED
-    except Exception as exc:
-        print(f"sync-catalog: cannot start Tidal session: {exc}", file=sys.stderr)
-        return 1
+    catalog, code = _tidal_catalog(conn, args, "sync-catalog")
+    if catalog is None:
+        return code
     res = sync_all(conn, catalog, None if args.all else args.artist, args.max_calls, args.force,
                    progress=lambda e: print(_line(e), flush=True))
     for n in res["unknown"]:
@@ -109,6 +118,36 @@ def cmd_sync_catalog(args, conn) -> int:
           f"stopped={res['stopped']}")
     if res["stopped"] == "paused":
         print(f"gate paused until {res['until']}")
+        return EXIT_PAUSED
+    if res["stopped"] == "auth":
+        print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.",
+              file=sys.stderr)
+    return 1 if res["stopped"] in ("network", "auth") else 0
+
+
+def cmd_candidates(args, conn) -> int:
+    rows, unknown, other = pending_artists(conn, args.artist)
+    notes = [f"{n}: not in the ledger (import-legacy first)" for n in unknown] + \
+            [f"{r['name']}: not ambiguous (tidal_match={r['tidal_match']}); skipped" for r in other]
+    if not args.json:
+        print(*notes, sep="\n", end="\n" if notes else "")
+    if not rows:  # decide before logging in: no work means no Tidal calls at all
+        print(json.dumps({"artists": [], "notes": notes, "stopped": None}, indent=2) if args.json
+              else "candidates: no ambiguous artists to compare; not contacting Tidal")
+        return 0
+    catalog, code = _tidal_catalog(conn, args, "candidates")
+    if catalog is None:
+        return code
+    res = run_candidates(conn, catalog, rows, progress=None if args.json else
+                         lambda r: print(format_result(r) + "\n", flush=True))
+    if args.json:
+        print(json.dumps({**res, "notes": notes}, indent=2))
+    else:
+        print(f"candidates: {len(res['artists'])} artist(s), "
+              f"{sum(r['recommendation'] is not None for r in res['artists'])} with a suggestion, "
+              f"{res['calls']} gate calls, stopped={res['stopped']}")
+    if res["stopped"] == "paused":
+        print(f"gate paused until {res['until']}", file=sys.stderr if args.json else sys.stdout)
         return EXIT_PAUSED
     if res["stopped"] == "auth":
         print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.",
@@ -142,6 +181,17 @@ def cmd_link(args, conn) -> int:
     conn.commit()
     print(f"link: {s['files']} files, {s['matched']} matched ({s['isrc']} isrc, {s['fuzzy']} fuzzy), "
           f"{s['unmatched']} unmatched")
+    return 0
+
+
+def cmd_regroup(args, conn) -> int:
+    row = _artist_by_name(conn, args.artist) if args.artist else None
+    if args.artist and row is None:
+        print(f"regroup: no artist '{args.artist}'", file=sys.stderr)
+        return 1
+    s = regroup_artist(conn, row["id"]) if row else regroup_all(conn)
+    conn.commit()
+    print(f"regroup: {s['recordings']} recordings -> {s['clusters']} clusters, {s['groups']} release groups")
     return 0
 
 
@@ -216,6 +266,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true", help="re-sync artists synced within 7 days, ignoring the cache")
     s.set_defaults(fn=cmd_sync_catalog)
 
+    s = sub.add_parser("candidates", help="compare ambiguous artists' Tidal profiles with owned albums (network)")
+    s.add_argument("--artist", action="append", default=[], metavar="NAME")
+    s.add_argument("--max-calls", type=int, default=150)
+    s.add_argument("--interval", type=_positive_float, default=2.0)
+    s.add_argument("--burst", type=_at_least_one, default=3)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_candidates)
+
     s = sub.add_parser("cache-clear", help="forget cached Tidal responses")
     s.add_argument("--artist", metavar="NAME")
     s.set_defaults(fn=cmd_cache_clear)
@@ -224,6 +282,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--artist")
     s.add_argument("--rematch", action="store_true")
     s.set_defaults(fn=cmd_link)
+
+    s = sub.add_parser("regroup", help="recompute release groups and recording clusters (no network)")
+    s.add_argument("--artist")
+    s.set_defaults(fn=cmd_regroup)
 
     s = sub.add_parser("report", help="what is owned / missing")
     s.add_argument("--artist")

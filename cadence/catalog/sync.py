@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests  # transitive dependency of tidalapi; only used to recognise a dead connection
 
+from cadence.catalog.groups import regroup_artist
 from cadence.gate.bucket import GatePaused
 from cadence.identity.normalize import norm_artist, norm_title, split_title
 from cadence.ledger.db import log_event
@@ -185,6 +186,7 @@ def sync_artist(conn: sqlite3.Connection, catalog: CatalogSource, artist_row) ->
             _upsert_track(conn, rid, _upsert_recording(conn, artist_id, t, stats), t)
             stats["tracks"] += 1
     stats["hidden"] = _hide_unlisted(conn, artist_id, {str(r.tidal_id) for r in releases})
+    regroup_artist(conn, artist_id)
     conn.execute("UPDATE artist SET catalog_synced_at = ? WHERE id = ?",
                  (_now().isoformat(timespec="seconds"), artist_id))
     log_event(conn, "catalog.sync", artist_row["name"],

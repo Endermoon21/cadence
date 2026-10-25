@@ -448,7 +448,8 @@ def test_report_states_missing_duplicates_unmatched_and_hidden():
 
     summary = report.library_summary(conn)
     assert summary == [{"artist_id": aid, "artist": "Will", "tidal_match": "auto", "own_releases": 3,
-                        "recordings_owned": 1, "recordings_total": 3, "missing": 2, "unmatched_files": 1}]
+                        "own_editions": 3, "recordings_owned": 1, "recordings_total": 3, "missing": 2,
+                        "missing_main": 2, "missing_variant": 0, "unmatched_files": 1}]
     text = report.format_artist_report(d)
     assert "Two" in text and "stray.flac" in text and "partial" in text and "one-b.flac" in text
     assert "Will" in report.format_summary(summary)

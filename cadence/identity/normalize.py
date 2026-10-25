@@ -28,6 +28,7 @@ _SUFFIX_KEYWORD_RE = re.compile(
 _GROUP_RE = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]")
 _YEAR_RE = re.compile(r"^\d{4}$")
 
+_NEUTRAL_PHRASES = ("standard version", "bonus track version", "bonus tracks")
 _NEUTRAL_EXACT = {
     "explicit": "explicit", "explicit version": "explicit",
     "clean": "clean", "clean version": "clean",
@@ -67,8 +68,11 @@ class TitleParts:
     flags: frozenset[str]
 
 
-def _neutral_flag(g: str) -> str | None:
-    """Flag name if the folded group is a neutral (identity-irrelevant) annotation."""
+def _neutral_flag(g: str, release: bool = False) -> str | None:
+    """Flag name if the folded group is a neutral (identity-irrelevant) annotation.
+
+    `release`: the title is a release title, where edition wording is noise. For track titles it can be the
+    identity ("Drumless Edition", "Ascension (Edition I / Pt. 1)"), so it only applies there."""
     tokens = g.split()
     if any(t.startswith("remaster") for t in tokens):
         rest = [t for t in tokens if not t.startswith("remaster")]
@@ -76,8 +80,18 @@ def _neutral_flag(g: str) -> str | None:
             return "remaster"
     if g in _NEUTRAL_EXACT:
         return _NEUTRAL_EXACT[g]
-    if _DELUXE_RE.search(g) and not _VARIANT_RE.search(g):
+    if _VARIANT_RE.search(g):
+        return None
+    if _DELUXE_RE.search(g):
         return "deluxe"
+    if not release:
+        return None
+    if "remasters" in tokens:
+        return "remaster"
+    if "edition" in tokens:
+        return "edition"
+    if any(p in g for p in _NEUTRAL_PHRASES):
+        return "neutral"
     return None
 
 
@@ -86,12 +100,12 @@ def _variant_label(g: str) -> str:
     return " ".join(words)
 
 
-def _classify(group: str) -> tuple[str, str] | None:
+def _classify(group: str, release: bool = False) -> tuple[str, str] | None:
     """('flag', name) | ('variant', label) | None (group stays in the base title)."""
     g = fold(group)
     if _FEAT_RE.match(g) or g.startswith("with "):
         return ("flag", "feat")
-    flag = _neutral_flag(g)
+    flag = _neutral_flag(g, release)
     if flag:
         return ("flag", flag)
     if _VARIANT_RE.search(g):
@@ -115,13 +129,13 @@ def _peel_suffixes(title: str) -> tuple[str, list[str]]:
     return title, suffixes[::-1]
 
 
-def split_title(title: str, version: str | None = None) -> TitleParts:
+def split_title(title: str, version: str | None = None, *, release: bool = False) -> TitleParts:
     flags: set[str] = set()
     variants: list[str] = []
     kept_tail: list[str] = []
 
     def take(group: str) -> bool:
-        c = _classify(group)
+        c = _classify(group, release)
         if c is None:
             return False
         if c[0] == "flag":
