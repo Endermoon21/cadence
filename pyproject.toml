@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cadence"
+version = "0.1.0"
+description = "Cadence: music library ledger and Tidal catalog gap finder"
+requires-python = ">=3.12"
+dependencies = [
+    "tidalapi==0.8.11",
+    "mutagen",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+cadence = "cadence.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cadence*"]
+
+[tool.setuptools.package-data]
+cadence = ["ledger/migrations/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

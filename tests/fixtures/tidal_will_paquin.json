@@ -1,0 +1,1228 @@
+[
+ {
+  "bucket": "ep_singles",
+  "id": 412366263,
+  "title": "Chandelier",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197207651569",
+  "date": "2020-09-25",
+  "explicit": true,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366264,
+    "isrc": "QM24S2009107",
+    "title": "Chandelier",
+    "version": null,
+    "dur": 127,
+    "n": 1,
+    "disc": 1,
+    "explicit": true,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366269,
+  "title": "Chandelier (Instrumental Version)",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197387918865",
+  "date": "2020-09-27",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366270,
+    "isrc": "QM24S2009206",
+    "title": "Chandelier (Instrumental Version)",
+    "version": null,
+    "dur": 128,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366257,
+  "title": "Now You Know",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197047996394",
+  "date": "2021-02-19",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366259,
+    "isrc": "QM24S2100959",
+    "title": "Now You Know",
+    "version": null,
+    "dur": 121,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366265,
+  "title": "21",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197207651859",
+  "date": "2021-04-02",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366266,
+    "isrc": "QZNWY2220407",
+    "title": "21",
+    "version": null,
+    "dur": 156,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366261,
+  "title": "Satellite",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197047997636",
+  "date": "2021-08-20",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366262,
+    "isrc": "QZNWR2242583",
+    "title": "Satellite",
+    "version": null,
+    "dur": 192,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366255,
+  "title": "Circles",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197047521237",
+  "date": "2022-08-26",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366256,
+    "isrc": "QZNWR2241464",
+    "title": "Circles",
+    "version": null,
+    "dur": 126,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "other",
+  "id": 251341263,
+  "title": "COMEBACK",
+  "version": null,
+  "type": "ALBUM",
+  "upc": "197208936382",
+  "date": "2022-09-25",
+  "explicit": true,
+  "n": 7,
+  "available": true,
+  "artists": [
+   "Noty"
+  ],
+  "tracks": [
+   {
+    "id": 251341264,
+    "isrc": "QZPLR2244729",
+    "title": "24/7 (feat. Sebas Versace)",
+    "version": null,
+    "dur": 249,
+    "n": 1,
+    "disc": 1,
+    "explicit": true,
+    "artists": [
+     "Noty",
+     "Sebas Versace"
+    ]
+   },
+   {
+    "id": 251341265,
+    "isrc": "QZPLR2244730",
+    "title": "Coqueteo Visual (feat. Papi Dolce & Sebas Versace)",
+    "version": null,
+    "dur": 219,
+    "n": 2,
+    "disc": 1,
+    "explicit": true,
+    "artists": [
+     "Noty",
+     "Papi Dolce",
+     "Sebas Versace"
+    ]
+   },
+   {
+    "id": 251341266,
+    "isrc": "QZPLR2244731",
+    "title": "No Te Culpo",
+    "version": null,
+    "dur": 163,
+    "n": 3,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Noty"
+    ]
+   },
+   {
+    "id": 251341267,
+    "isrc": "QZPLR2244732",
+    "title": "Obsesionado",
+    "version": null,
+    "dur": 190,
+    "n": 4,
+    "disc": 1,
+    "explicit": true,
+    "artists": [
+     "Noty"
+    ]
+   },
+   {
+    "id": 251341268,
+    "isrc": "QZPLR2244733",
+    "title": "SAY ME WHAT U THINK (feat. ACSIM)",
+    "version": null,
+    "dur": 216,
+    "n": 5,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Noty",
+     "ACSIM"
+    ]
+   },
+   {
+    "id": 251341269,
+    "isrc": "QZPLR2244734",
+    "title": "When The Sun Goes Down (feat. Will Paquin)",
+    "version": null,
+    "dur": 215,
+    "n": 6,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Noty",
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 251341270,
+    "isrc": "QZPLR2244735",
+    "title": "Run It Down (Bonus Track)",
+    "version": null,
+    "dur": 217,
+    "n": 7,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Noty"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366267,
+  "title": "In Two",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197272297921",
+  "date": "2022-11-18",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366268,
+    "isrc": "QZTAX2251123",
+    "title": "In Two",
+    "version": null,
+    "dur": 143,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366273,
+  "title": "Drown",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197745135019",
+  "date": "2023-05-12",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366274,
+    "isrc": "QZHNC2300287",
+    "title": "Drown",
+    "version": null,
+    "dur": 164,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366271,
+  "title": "Lightning",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "197511001944",
+  "date": "2023-07-14",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366272,
+    "isrc": "QZNWR2330919",
+    "title": "Lightning",
+    "version": null,
+    "dur": 196,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "other",
+  "id": 298880016,
+  "title": "Songs To Come Home To",
+  "version": null,
+  "type": "ALBUM",
+  "upc": "196922508950",
+  "date": "2023-08-25",
+  "explicit": false,
+  "n": 20,
+  "available": true,
+  "artists": [
+   "Ta-ku"
+  ],
+  "tracks": [
+   {
+    "id": 298880019,
+    "isrc": "AUFF02300407",
+    "title": "THE END",
+    "version": null,
+    "dur": 298,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Thrupence",
+     "Will Paquin",
+     "rum.gold"
+    ]
+   },
+   {
+    "id": 298880021,
+    "isrc": "AUFF02300408",
+    "title": "HOME (Kenny's Interlude)",
+    "version": null,
+    "dur": 68,
+    "n": 2,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Joekenneth"
+    ]
+   },
+   {
+    "id": 298880022,
+    "isrc": "AUFF02300375",
+    "title": "SMILE",
+    "version": null,
+    "dur": 199,
+    "n": 3,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Xavier Om\u00e4r",
+     "DAISY WORLD",
+     "ROMderful"
+    ]
+   },
+   {
+    "id": 298880023,
+    "isrc": "AUFF02300406",
+    "title": "WAY OUT",
+    "version": null,
+    "dur": 198,
+    "n": 4,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Milan Ring",
+     "matt mcwaters",
+     "Questlove"
+    ]
+   },
+   {
+    "id": 298880024,
+    "isrc": "AUFF02300409",
+    "title": "CRY",
+    "version": null,
+    "dur": 200,
+    "n": 5,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Becca Hatch"
+    ]
+   },
+   {
+    "id": 298880025,
+    "isrc": "AUFF02300410",
+    "title": "INNER SOUL",
+    "version": null,
+    "dur": 174,
+    "n": 6,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Chanel Loren",
+     "matt mcwaters"
+    ]
+   },
+   {
+    "id": 298880027,
+    "isrc": "AUFF02300411",
+    "title": "BETTER",
+    "version": null,
+    "dur": 166,
+    "n": 7,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Billy Davis",
+     "Jay Prince"
+    ]
+   },
+   {
+    "id": 298880029,
+    "isrc": "AUFF02300412",
+    "title": "CALL MY NAME",
+    "version": null,
+    "dur": 223,
+    "n": 8,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "JMSN"
+    ]
+   },
+   {
+    "id": 298880031,
+    "isrc": "AUFF02300413",
+    "title": "HARD2SAY",
+    "version": null,
+    "dur": 168,
+    "n": 9,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "1300",
+     "Sango"
+    ]
+   },
+   {
+    "id": 298880033,
+    "isrc": "AUFF02300414",
+    "title": "TWO OF US",
+    "version": null,
+    "dur": 244,
+    "n": 10,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "alayna"
+    ]
+   },
+   {
+    "id": 298880034,
+    "isrc": "AUFF02300415",
+    "title": "THROUGH AND FALLING",
+    "version": null,
+    "dur": 205,
+    "n": 11,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "matt mcwaters",
+     "kerri"
+    ]
+   },
+   {
+    "id": 298880035,
+    "isrc": "AUFF02300416",
+    "title": "WE GOT",
+    "version": null,
+    "dur": 277,
+    "n": 12,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Louis Baker",
+     "Repeat Pattern"
+    ]
+   },
+   {
+    "id": 298880037,
+    "isrc": "AUFF02300417",
+    "title": "KNOW ME",
+    "version": null,
+    "dur": 164,
+    "n": 13,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "No\u00e9",
+     "James Poyser",
+     "Kaina"
+    ]
+   },
+   {
+    "id": 298880039,
+    "isrc": "AUFF02300418",
+    "title": "THE SCORE",
+    "version": null,
+    "dur": 219,
+    "n": 14,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Panama"
+    ]
+   },
+   {
+    "id": 298880040,
+    "isrc": "AUFF02300419",
+    "title": "LIGHTNING",
+    "version": null,
+    "dur": 173,
+    "n": 15,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Wafia"
+    ]
+   },
+   {
+    "id": 298880041,
+    "isrc": "AUFF02300420",
+    "title": "RUNAWAY",
+    "version": null,
+    "dur": 280,
+    "n": 16,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Rini",
+     "Touch Sensitive"
+    ]
+   },
+   {
+    "id": 298880042,
+    "isrc": "AUFF02300421",
+    "title": "DAWN",
+    "version": null,
+    "dur": 234,
+    "n": 17,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "No\u00e9",
+     "Cabu",
+     "TR\u016a SAALI"
+    ]
+   },
+   {
+    "id": 298880043,
+    "isrc": "AUFF02300422",
+    "title": "HOPES & DREAMS",
+    "version": null,
+    "dur": 293,
+    "n": 18,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "Swoo",
+     "Keith Kugo"
+    ]
+   },
+   {
+    "id": 298880045,
+    "isrc": "AUFF02300423",
+    "title": "THINKING OF YOU",
+    "version": null,
+    "dur": 200,
+    "n": 19,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku"
+    ]
+   },
+   {
+    "id": 298880046,
+    "isrc": "AUFF02300424",
+    "title": "TAKE ON ME  (Bonus Cover)",
+    "version": null,
+    "dur": 193,
+    "n": 20,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Ta-ku",
+     "No\u00e9"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366275,
+  "title": "Mando",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "198085209989",
+  "date": "2024-02-23",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366278,
+    "isrc": "QZES52439589",
+    "title": "Mando",
+    "version": null,
+    "dur": 161,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366528,
+  "title": "Grass",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "198471709437",
+  "date": "2024-04-16",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366529,
+    "isrc": "QZHNB2435176",
+    "title": "Grass",
+    "version": null,
+    "dur": 129,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 412366522,
+  "title": "Will Paquin",
+  "version": null,
+  "type": "EP",
+  "upc": "198094907999",
+  "date": "2024-06-07",
+  "explicit": false,
+  "n": 5,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 412366523,
+    "isrc": "QZMEN2432056",
+    "title": "Merry Go Round",
+    "version": null,
+    "dur": 171,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 412366524,
+    "isrc": "QZMEN2432057",
+    "title": "Two Chairs",
+    "version": null,
+    "dur": 163,
+    "n": 2,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 412366525,
+    "isrc": "QZES52439589",
+    "title": "Mando",
+    "version": null,
+    "dur": 161,
+    "n": 3,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 412366526,
+    "isrc": "QZHNB2435176",
+    "title": "Grass",
+    "version": null,
+    "dur": 129,
+    "n": 4,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 412366527,
+    "isrc": "QZMEN2432058",
+    "title": "Honky Tonk Yeet",
+    "version": null,
+    "dur": 115,
+    "n": 5,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 382375742,
+  "title": "Infinite Jest",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "617308085167",
+  "date": "2024-09-13",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 382375744,
+    "isrc": "QMB622400121",
+    "title": "Infinite Jest",
+    "version": null,
+    "dur": 139,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 386709088,
+  "title": "Infinite Jest",
+  "version": null,
+  "type": "EP",
+  "upc": "617308086348",
+  "date": "2024-10-03",
+  "explicit": false,
+  "n": 4,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 386709089,
+    "isrc": "QMB622400122",
+    "title": "Rainy Days",
+    "version": null,
+    "dur": 175,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 386709090,
+    "isrc": "QMB622400121",
+    "title": "Infinite Jest",
+    "version": null,
+    "dur": 139,
+    "n": 2,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 386709091,
+    "isrc": "QMB622400123",
+    "title": "Peas Theme",
+    "version": null,
+    "dur": 111,
+    "n": 3,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 386709092,
+    "isrc": "QMB622400124",
+    "title": "Axle",
+    "version": null,
+    "dur": 165,
+    "n": 4,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 430490010,
+  "title": "Hahaha",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "617308101867",
+  "date": "2025-05-14",
+  "explicit": false,
+  "n": 1,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 430490011,
+    "isrc": "QMB622500314",
+    "title": "Hahaha",
+    "version": null,
+    "dur": 161,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 436193963,
+  "title": "I Work So Hard",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "617308103106",
+  "date": "2025-06-24",
+  "explicit": false,
+  "n": 2,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 436193965,
+    "isrc": "QMB622500318",
+    "title": "I Work So Hard",
+    "version": null,
+    "dur": 197,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 436193966,
+    "isrc": "QMB622500314",
+    "title": "Hahaha",
+    "version": null,
+    "dur": 161,
+    "n": 2,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "ep_singles",
+  "id": 444752784,
+  "title": "We Really Done It This Time",
+  "version": null,
+  "type": "SINGLE",
+  "upc": "617308104998",
+  "date": "2025-08-06",
+  "explicit": false,
+  "n": 3,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 444752785,
+    "isrc": "QMB622500315",
+    "title": "We Really Done It This Time",
+    "version": null,
+    "dur": 200,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 444752786,
+    "isrc": "QMB622500318",
+    "title": "I Work So Hard",
+    "version": null,
+    "dur": 197,
+    "n": 2,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 444752787,
+    "isrc": "QMB622500314",
+    "title": "Hahaha",
+    "version": null,
+    "dur": 161,
+    "n": 3,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ },
+ {
+  "bucket": "albums",
+  "id": 434296804,
+  "title": "Hahaha",
+  "version": null,
+  "type": "ALBUM",
+  "upc": "617308102024",
+  "date": "2025-09-12",
+  "explicit": true,
+  "n": 11,
+  "available": true,
+  "artists": [
+   "Will Paquin"
+  ],
+  "tracks": [
+   {
+    "id": 434296805,
+    "isrc": "QMB622500315",
+    "title": "We Really Done It This Time",
+    "version": null,
+    "dur": 200,
+    "n": 1,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296806,
+    "isrc": "QMB622500314",
+    "title": "Hahaha",
+    "version": null,
+    "dur": 161,
+    "n": 2,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296807,
+    "isrc": "QMB622500316",
+    "title": "Orangutan",
+    "version": null,
+    "dur": 178,
+    "n": 3,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296808,
+    "isrc": "QMB622500317",
+    "title": "Roll The Dice",
+    "version": null,
+    "dur": 111,
+    "n": 4,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296809,
+    "isrc": "QMB622500318",
+    "title": "I Work So Hard",
+    "version": null,
+    "dur": 197,
+    "n": 5,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296810,
+    "isrc": "QMB622500319",
+    "title": "Slifer The Sky Dragon",
+    "version": null,
+    "dur": 290,
+    "n": 6,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296811,
+    "isrc": "QMB622500320",
+    "title": "Everything",
+    "version": null,
+    "dur": 178,
+    "n": 7,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296812,
+    "isrc": "QMB622500321",
+    "title": "Gum (Do You Want Some?)",
+    "version": null,
+    "dur": 151,
+    "n": 8,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296813,
+    "isrc": "QMB622500322",
+    "title": "Our World Is Falling Apart",
+    "version": null,
+    "dur": 147,
+    "n": 9,
+    "disc": 1,
+    "explicit": true,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296814,
+    "isrc": "QMB622500323",
+    "title": "I Need To Know",
+    "version": null,
+    "dur": 162,
+    "n": 10,
+    "disc": 1,
+    "explicit": false,
+    "artists": [
+     "Will Paquin"
+    ]
+   },
+   {
+    "id": 434296815,
+    "isrc": "QMB622500324",
+    "title": "Jibby\u2019s Theme",
+    "version": null,
+    "dur": 153,
+    "n": 11,
+    "disc": 1,
+    "explicit": true,
+    "artists": [
+     "Will Paquin"
+    ]
+   }
+  ]
+ }
+]
