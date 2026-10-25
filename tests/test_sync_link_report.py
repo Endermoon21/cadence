@@ -261,16 +261,6 @@ def test_error_message_redacts_session_ids_even_without_a_query_string():
     assert "abc123" not in msg and "tok123" not in msg and msg.startswith("ValueError: bad ")
 
 
-def test_connection_error_stops_the_whole_run():
-    err = requests.exceptions.ConnectionError("Max retries exceeded with url: /v1/x?sessionId=SECRET")
-    conn, cat = three_artists(fail_on_releases={2: err})
-    res = sync_all(conn, cat)
-    assert (res["stopped"], res["synced"], res["errors"]) == ("network", 1, 1)
-    assert [a["artist"] for a in res["artists"]] == ["Aaa", "Bbb"]                  # Ccc never attempted
-    msg = conn.execute("SELECT message FROM event_log WHERE kind = 'catalog.error'").fetchone()[0]
-    assert msg.startswith("ConnectionError:") and "SECRET" not in msg and "?" not in msg
-
-
 # ---------------------------------------------------------------- ambiguous artists / vanished releases
 
 def test_ambiguous_artist_is_not_synced_until_set_manually():
@@ -601,15 +591,6 @@ def test_the_gate_decides_before_auth_classification():
     assert not _is_auth_failure(e) and _is_auth_failure(AuthenticationError("x"))
 
 
-def test_timeouts_stop_the_run_like_a_dead_connection():
-    for err in (requests.exceptions.ReadTimeout("Read timed out. (read timeout=30)"),
-                requests.exceptions.ConnectTimeout("Connect timed out"), TimeoutError("timed out")):
-        conn, cat = three_artists(fail_on_releases={2: err})
-        res = sync_all(conn, cat)
-        assert (res["stopped"], res["synced"], res["errors"]) == ("network", 1, 1), repr(err)
-        assert [a["artist"] for a in res["artists"]] == ["Aaa", "Bbb"]
-
-
 def test_ambiguous_and_none_artists_cost_nothing_on_later_runs_even_with_force():
     conn = mem()
     add_artist(conn, "Twin")
@@ -709,3 +690,103 @@ def test_gate_pause_and_budget_during_release_tracks_are_never_swallowed_as_404(
     res = sync_all(conn, cat, max_calls=5)         # Aaa: 3 calls; Bbb: search (4), releases (5), tracks refused
     assert res["stopped"] == "budget" and res["synced"] == 1
     assert conn.execute("SELECT COUNT(*) FROM release WHERE artist_id = 2").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------- network failures: continue, back off, give up after 3
+
+def many_artists(n, fail_on_releases=None):
+    """Artists A1..An, each with one release and one track; tidal id = index."""
+    conn = mem()
+    refs = {}
+    for i in range(1, n + 1):
+        add_artist(conn, f"A{i}", tidal_id=i, tidal_match="manual")
+        refs[i] = ArtistRef(i, f"A{i}")
+    return conn, FakeCatalog(make_gate(),
+                             releases={i: [rel(10 * i, f"R{i}", [refs[i]])] for i in refs},
+                             tracks={10 * i: [trk(100 * i, f"S{i}", 100, f"ISRC{i}")] for i in refs},
+                             fail_on_releases=fail_on_releases)
+
+
+def run(conn, cat, **kw):
+    sleeps = []
+    res = sync_all(conn, cat, sleep=sleeps.append, **kw)
+    return res, sleeps
+
+
+def timeout(msg="Read timed out. (read timeout=30)"):
+    return requests.exceptions.ReadTimeout(msg)
+
+
+def statuses(res):
+    return [(a["artist"], a["status"]) for a in res["artists"]]
+
+
+def test_one_network_failure_is_an_artist_error_and_the_run_continues():
+    kinds = (requests.exceptions.ReadTimeout("Read timed out. (read timeout=30)"),
+             requests.exceptions.ConnectTimeout("Connect timed out"),
+             requests.exceptions.ConnectionError("Max retries exceeded with url: /v1/x?sessionId=SECRET"),
+             TimeoutError("timed out"), ConnectionResetError("reset"))
+    for err in kinds:
+        conn, cat = many_artists(3, {2: err})
+        res, sleeps = run(conn, cat)
+        assert (res["stopped"], res["synced"], res["errors"]) == (None, 2, 1), repr(err)
+        assert statuses(res) == [("A1", "synced"), ("A2", "error"), ("A3", "synced")]
+        assert sleeps == [30]                                    # before A3, the next artist
+        msg = conn.execute("SELECT message FROM event_log WHERE kind = 'catalog.error'").fetchone()[0]
+        assert msg.startswith(type(err).__name__ + ":") and "SECRET" not in msg and "?" not in msg
+        row_ = conn.execute("SELECT catalog_synced_at FROM artist WHERE name = 'A2'").fetchone()
+        assert row_[0] is None
+        assert conn.execute("SELECT COUNT(*) FROM release WHERE artist_id = 2").fetchone()[0] == 0
+
+
+def test_three_network_failures_in_a_row_stop_the_run_with_backoffs_30_then_120():
+    conn, cat = many_artists(5, {1: timeout(), 2: timeout(), 3: timeout()})
+    res, sleeps = run(conn, cat)
+    assert (res["stopped"], res["synced"], res["errors"]) == ("network", 0, 3)
+    assert statuses(res) == [("A1", "error"), ("A2", "error"), ("A3", "error")]        # A4, A5 never attempted
+    assert sleeps == [30, 120]                                   # nothing to wait for after the last failure
+    assert conn.execute("SELECT COUNT(*) FROM artist WHERE catalog_synced_at IS NOT NULL").fetchone()[0] == 0
+
+
+def test_the_failure_counter_resets_after_any_artist_that_completes():
+    # two failures, a success, two more failures, a success: never 3 in a row
+    conn, cat = many_artists(6, {1: timeout(), 2: timeout(), 4: timeout(), 5: timeout()})
+    res, sleeps = run(conn, cat)
+    assert (res["stopped"], res["synced"], res["errors"]) == (None, 2, 4)
+    assert sleeps == [30, 120, 30, 120]                          # the ladder starts over after the success
+
+    # a non-network error also resets it
+    conn, cat = many_artists(6, {1: timeout(), 2: timeout(), 3: RuntimeError("boom"), 4: timeout(), 5: timeout()})
+    res, sleeps = run(conn, cat)
+    assert (res["stopped"], res["synced"], res["errors"]) == (None, 1, 5)
+    assert sleeps == [30, 120, 30, 120]
+
+    # so does an unresolved artist: A1 fails, A15 (not on Tidal) completes, A2 and A3 fail -> 2 in a row, not 3
+    conn, cat = many_artists(3, {1: timeout(), 2: timeout(), 3: timeout()})
+    add_artist(conn, "A15")
+    res, sleeps = run(conn, cat)
+    assert (res["stopped"], res["unresolved"], res["errors"]) == (None, 1, 3)
+    assert sleeps == [30, 30]
+
+
+def test_no_backoff_when_nothing_is_attempted_after_a_failure():
+    conn, cat = many_artists(3, {3: timeout()})                  # the last artist fails
+    res, sleeps = run(conn, cat)
+    assert (res["errors"], res["stopped"], sleeps) == (1, None, [])
+    conn, cat = many_artists(3, {1: timeout()})
+    conn.execute("UPDATE artist SET catalog_synced_at = datetime('now') WHERE name = 'A2'")
+    res, sleeps = run(conn, cat)                                 # A2 is skipped (no work, no waiting), A3 is attempted
+    assert statuses(res) == [("A1", "error"), ("A2", "skipped"), ("A3", "synced")] and sleeps == [30]
+
+
+def test_gate_budget_and_auth_still_stop_immediately_and_never_back_off():
+    conn, cat = many_artists(3, {1: timeout(), 2: http_error(401)})
+    res, sleeps = run(conn, cat)
+    assert (res["stopped"], sleeps) == ("auth", [30])            # the earlier timeout's backoff, then the stop
+    conn, cat = many_artists(3, {1: timeout()})
+    cat.trip_on_releases = 2
+    res, sleeps = run(conn, cat)
+    assert (res["stopped"], sleeps) == ("paused", [30])
+    conn, cat = many_artists(3, {1: timeout()})
+    res, sleeps = run(conn, cat, max_calls=2)
+    assert res["stopped"] == "budget"

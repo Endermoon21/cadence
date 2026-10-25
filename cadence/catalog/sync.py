@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,8 @@ NOT_IN_LISTING = "not_in_tidal_listing"
 
 DURATION_TOLERANCE_S = 2
 RESYNC_AFTER = timedelta(days=7)
+NETWORK_BACKOFF_S = (30, 120)  # pause before the next artist after the 1st / 2nd network failure in a row
+MAX_NETWORK_FAILURES = 3  # this many artists in a row failing on the network ends the run
 
 
 def _now() -> datetime:
@@ -282,11 +285,13 @@ def _is_dead_connection(exc: Exception) -> bool:
 
 def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] | None = None,
              max_calls: int = 400, force: bool = False,
-             progress: Callable[[dict], None] | None = None) -> dict:
+             progress: Callable[[dict], None] | None = None, sleep: Callable[[float], None] = time.sleep) -> dict:
     """Sync artists by name.
 
-    Stops cleanly when the gate pauses (stopped='paused'), the call budget is spent ('budget'), the
-    network is gone ('network') or Tidal rejects our login ('auth'). Any other error is logged against that artist and the run continues."""
+    Stops cleanly when the gate pauses (stopped='paused'), the call budget is spent ('budget') or Tidal
+    rejects our login ('auth'). Any other error, including a timeout or dropped connection, is logged against
+    that artist and the run continues; after a network failure it waits NETWORK_BACKOFF_S before the next
+    artist, and MAX_NETWORK_FAILURES artists in a row failing that way stops the run ('network')."""
     catalog.max_calls = max_calls
     catalog.use_cache = not force
     rows, unknown = select_artists(conn, names)
@@ -299,6 +304,8 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
         if progress:
             progress(entry)
 
+    network_failures = 0  # consecutive artists that failed on the network
+    backoff = 0
     for row in rows:
         waiting = work_status(row, force)
         if waiting != "due":
@@ -308,6 +315,9 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
             else:
                 record(row, waiting)
             continue
+        if backoff:
+            sleep(backoff)
+            backoff = 0
         try:
             tid = resolve_artist(conn, catalog, row)
             fresh = conn.execute("SELECT * FROM artist WHERE id = ?", (row["id"],)).fetchone()
@@ -323,6 +333,7 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
                 record(row, "synced", **stats)
                 result["synced"] += 1
                 result["release_missing"] += stats["release_missing"]
+            network_failures = 0
         except GatePaused as p:
             conn.rollback()
             result["stopped"] = "paused"
@@ -349,9 +360,14 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
             if _is_auth_failure(exc):
                 result["stopped"] = "auth"      # every further artist would fail the same way
                 break
-            if _is_dead_connection(exc):
+            if not _is_dead_connection(exc):
+                network_failures = 0
+                continue
+            network_failures += 1
+            if network_failures >= MAX_NETWORK_FAILURES:
                 result["stopped"] = "network"
                 break
+            backoff = NETWORK_BACKOFF_S[min(network_failures, len(NETWORK_BACKOFF_S)) - 1]
     result["calls"] = catalog.gate.calls
     return result
 
