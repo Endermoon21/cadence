@@ -12,6 +12,7 @@ import requests  # transitive dependency of tidalapi; only used to recognise a d
 from cadence.gate.bucket import GatePaused
 from cadence.identity.normalize import norm_artist, norm_title, split_title
 from cadence.ledger.db import log_event
+from cadence.sources import base
 from cadence.sources.base import BudgetExceeded, CatalogSource, ReleaseDTO, TrackDTO
 
 NOT_IN_LISTING = "not_in_tidal_listing"
@@ -144,10 +145,31 @@ def sync_artist(conn: sqlite3.Connection, catalog: CatalogSource, artist_row) ->
     artist_id, tid = artist_row["id"], artist_row["tidal_id"]
     releases = catalog.artist_releases(tid)
     own = {r.tidal_id: bool(r.artists) and r.artists[0].id == tid for r in releases}
-    tracks = {r.tidal_id: catalog.release_tracks(r.tidal_id) for r in releases if own[r.tidal_id]}
+    tracks: dict[int, list[TrackDTO]] = {}
+    gone: list[ReleaseDTO] = []
+    for r in releases:
+        if not own[r.tidal_id]:
+            continue
+        try:
+            tracks[r.tidal_id] = catalog.release_tracks(r.tidal_id)
+        except (GatePaused, BudgetExceeded):
+            raise
+        except Exception as exc:
+            if not _is_not_found(exc):
+                raise
+            tracks[r.tidal_id] = []      # the failure was not cached by the source; a later sync retries it
+            gone.append(r)
 
+    if gone and len(gone) == len(tracks):
+        ids = ", ".join(str(r.tidal_id) for r in gone[:5]) + (" ..." if len(gone) > 5 else "")
+        raise ReleaseTracksMissing(f"Tidal returned 404 for the tracks of all {len(gone)} own release(s) "
+                                   f"({ids}); not marking the artist as synced")
     stats = {"releases": 0, "own": 0, "appears_on": 0, "tracks": 0, "recordings_new": 0, "shared": 0,
-             "hidden": 0}
+             "hidden": 0, "release_missing": len(gone)}
+    for r in gone:
+        log_event(conn, "catalog.release_missing", artist_row["name"],
+                  f"Tidal returned 404 for the tracks of release {r.tidal_id} '{r.title}'; "
+                  "kept it without tracks", {"release_id": r.tidal_id})
     for r in releases:
         role = "own" if own[r.tidal_id] else "appears_on"
         rid = _upsert_release(conn, artist_id, r, role)
@@ -179,6 +201,70 @@ def _recently_synced(row) -> bool:
     return _now() - at < RESYNC_AFTER
 
 
+def work_status(row, force: bool = False) -> str:
+    """'due' if this artist needs Tidal calls now; otherwise why not: ambiguous | unresolved | skipped.
+
+    ambiguous / none artists wait for `cadence artist set-tidal`, even with --force."""
+    if row["tidal_match"] == "ambiguous":
+        return "ambiguous"
+    if row["tidal_match"] == "none":
+        return "unresolved"
+    if not force and _recently_synced(row):
+        return "skipped"
+    return "due"
+
+
+def select_artists(conn: sqlite3.Connection, names: list[str] | None) -> tuple[list, list[str]]:
+    """(artist rows, names that are not in the ledger)"""
+    rows = conn.execute("SELECT * FROM artist ORDER BY norm_name").fetchall()
+    if names is None:
+        return rows, []
+    wanted = {norm_artist(n): n for n in names}
+    rows = [r for r in rows if r["norm_name"] in wanted]
+    have = {r["norm_name"] for r in rows}
+    return rows, [n for k, n in wanted.items() if k not in have]
+
+
+def pending_work(conn: sqlite3.Connection, names: list[str] | None, force: bool = False) -> dict:
+    """What sync_all would do, without touching Tidal: counts per work_status plus unknown names."""
+    rows, unknown = select_artists(conn, names)
+    counts = {"due": 0, "skipped": 0, "ambiguous": 0, "unresolved": 0}
+    for r in rows:
+        counts[work_status(r, force)] += 1
+    return {**counts, "unknown": unknown}
+
+
+def _chain(exc: BaseException):
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def _named(exc: BaseException, name: str) -> bool:
+    return any(c.__name__ == name for e in _chain(exc) for c in type(e).__mro__)
+
+
+def _statuses(exc: BaseException) -> set[int]:
+    return {getattr(getattr(e, "response", None), "status_code", None) for e in _chain(exc)}
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    return _named(exc, "ObjectNotFound") or 404 in _statuses(exc)
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Our login is rejected: HTTP 401 or an AuthenticationError, unless a 429 caused it (that is the gate's
+    business). A 403 is *not* auth: Tidal also uses it for single restricted items."""
+    statuses = _statuses(exc)
+    return (_named(exc, "AuthenticationError") or 401 in statuses) and 429 not in statuses
+
+
+class ReleaseTracksMissing(RuntimeError):
+    """Every own release of an artist answered 404 for its tracks; the listing itself is suspect."""
+
+
 _QUERY_OR_SECRET = re.compile(r"(?i)(sessionid\S*|bearer\s+\S+)")
 
 
@@ -189,7 +275,9 @@ def _safe_message(exc: Exception) -> str:
 
 
 def _is_dead_connection(exc: Exception) -> bool:
-    return isinstance(exc, (requests.exceptions.ConnectionError, ConnectionError))
+    """No usable network: refused / dropped connections and timeouts."""
+    return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                            ConnectionError, TimeoutError))
 
 
 def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] | None = None,
@@ -197,18 +285,13 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
              progress: Callable[[dict], None] | None = None) -> dict:
     """Sync artists by name.
 
-    Stops cleanly when the gate pauses (stopped='paused'), the call budget is spent ('budget') or the
-    network is gone ('network'). Any other error is logged against that artist and the run continues."""
+    Stops cleanly when the gate pauses (stopped='paused'), the call budget is spent ('budget'), the
+    network is gone ('network') or Tidal rejects our login ('auth'). Any other error is logged against that artist and the run continues."""
     catalog.max_calls = max_calls
-    rows = conn.execute("SELECT * FROM artist ORDER BY norm_name").fetchall()
-    unknown: list[str] = []
-    if names is not None:
-        wanted = {norm_artist(n): n for n in names}
-        rows = [r for r in rows if r["norm_name"] in wanted]
-        have = {r["norm_name"] for r in rows}
-        unknown = [n for k, n in wanted.items() if k not in have]
+    catalog.use_cache = not force
+    rows, unknown = select_artists(conn, names)
     result: dict = {"artists": [], "synced": 0, "skipped": 0, "unresolved": 0, "ambiguous": 0, "errors": 0,
-                    "unknown": unknown, "stopped": None, "until": None}
+                    "release_missing": 0, "unknown": unknown, "stopped": None, "until": None}
 
     def record(row, status: str, **extra) -> None:
         entry = {"artist": row["name"], "status": status, **extra}
@@ -217,9 +300,13 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
             progress(entry)
 
     for row in rows:
-        if not force and _recently_synced(row):
-            result["skipped"] += 1
-            record(row, "skipped")
+        waiting = work_status(row, force)
+        if waiting != "due":
+            result[waiting] += 1
+            if waiting == "ambiguous":
+                record(row, waiting, candidates=len(json.loads(row["tidal_candidates"] or "[]")))
+            else:
+                record(row, waiting)
             continue
         try:
             tid = resolve_artist(conn, catalog, row)
@@ -232,8 +319,10 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
                 result["unresolved"] += 1
                 record(row, "unresolved")
             else:
-                record(row, "synced", **sync_artist(conn, catalog, fresh))
+                stats = sync_artist(conn, catalog, fresh)
+                record(row, "synced", **stats)
                 result["synced"] += 1
+                result["release_missing"] += stats["release_missing"]
         except GatePaused as p:
             conn.rollback()
             result["stopped"] = "paused"
@@ -257,8 +346,32 @@ def sync_all(conn: sqlite3.Connection, catalog: CatalogSource, names: list[str] 
             log_event(conn, "catalog.error", row["name"], msg)
             conn.commit()
             record(row, "error", error=msg)
+            if _is_auth_failure(exc):
+                result["stopped"] = "auth"      # every further artist would fail the same way
+                break
             if _is_dead_connection(exc):
                 result["stopped"] = "network"
                 break
     result["calls"] = catalog.gate.calls
     return result
+
+
+def clear_cache(conn: sqlite3.Connection, artist_row=None) -> int:
+    """Delete cached Tidal responses; returns rows deleted.
+
+    No artist: every `tidal:%` key. With an artist: its release listing plus the track lists of its releases
+    (from the ledger and from the cached listing, which covers releases an interrupted sync never wrote)."""
+    if artist_row is None:
+        n = conn.execute("DELETE FROM catalog_cache WHERE key LIKE 'tidal:%'").rowcount
+    else:
+        listing = f"tidal:releases:{artist_row['tidal_id']}"
+        ids = {int(r[0]) for r in conn.execute(
+            "SELECT s.provider_ref FROM release_source s JOIN release r ON r.id = s.release_id "
+            "WHERE s.provider = 'tidal' AND r.artist_id = ?", (artist_row["id"],))}
+        cached = conn.execute("SELECT body FROM catalog_cache WHERE key = ?", (listing,)).fetchone()
+        if cached:
+            ids |= {r.tidal_id for r in base.from_json(cached[0])}
+        keys = [listing, *(f"tidal:tracks:{i}" for i in sorted(ids))]
+        n = sum(conn.execute("DELETE FROM catalog_cache WHERE key = ?", (k,)).rowcount for k in keys)
+    conn.commit()
+    return n

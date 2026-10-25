@@ -56,12 +56,13 @@ class FakeCatalog:
     """CatalogSource over in-memory dicts; every operation spends one real-Gate call (and the call budget).
 
     `trip_on_releases` / `trip_on_tracks`: Tidal artist id / release id whose fetch raises TooManyRequests.
-    `fail_on_releases`: {artist id: exception} raised from artist_releases()."""
+    `fail_on_releases` / `fail_on_tracks`: {artist id / release id: exception} raised from that fetch."""
 
     def __init__(self, gate: Gate, search: dict[str, list[ArtistRef]] | None = None,
                  releases: dict[int, list[ReleaseDTO]] | None = None,
                  tracks: dict[int, list[TrackDTO]] | None = None, trip_on_releases: int | None = None,
-                 trip_on_tracks: int | None = None, fail_on_releases: dict[int, Exception] | None = None):
+                 trip_on_tracks: int | None = None, fail_on_releases: dict[int, Exception] | None = None,
+                 fail_on_tracks: dict[int, Exception] | None = None):
         self.gate = gate
         self.max_calls: int | None = None
         self._search = {k.lower(): v for k, v in (search or {}).items()}
@@ -70,6 +71,8 @@ class FakeCatalog:
         self.trip_on_releases = trip_on_releases
         self.trip_on_tracks = trip_on_tracks
         self.fail_on_releases = fail_on_releases or {}
+        self.fail_on_tracks = fail_on_tracks or {}
+        self.use_cache = True
         self.track_calls: list[int] = []
 
     def search_artists(self, name: str) -> list[ArtistRef]:
@@ -90,6 +93,8 @@ class FakeCatalog:
         def go():
             if tidal_release_id == self.trip_on_tracks:
                 raise TooManyRequests(120)
+            if tidal_release_id in self.fail_on_tracks:
+                raise self.fail_on_tracks[tidal_release_id]
             return list(self._tracks.get(tidal_release_id, []))
         return gated_call(self, go)
 

@@ -4,7 +4,7 @@ import requests
 
 from cadence import report
 from cadence.catalog.link import link_files
-from cadence.catalog.sync import resolve_artist, sync_all, sync_artist
+from cadence.catalog.sync import clear_cache, resolve_artist, sync_all, sync_artist, work_status
 from cadence.ledger import db
 from cadence.sources.base import ArtistRef
 from cadence.sources.tidal import CatalogCache, TidalCatalog
@@ -163,7 +163,7 @@ def test_sync_all_skips_unresolved_artists():
 
 # ---------------------------------------------------------------- sync_all stops
 
-def three_artists(trip_on_tracks=None, fail_on_releases=None):
+def three_artists(trip_on_tracks=None, fail_on_releases=None, fail_on_tracks=None):
     """Aaa: 1 release; Bbb: 2 releases; Ccc: 1 release. A full sync costs 3 + 4 + 3 gate calls."""
     conn = mem()
     names = ["Aaa", "Bbb", "Ccc"]
@@ -177,7 +177,7 @@ def three_artists(trip_on_tracks=None, fail_on_releases=None):
     tracks = {10: [trk(100, "Aaa song", 100, "ISRC1")], 20: [trk(200, "Bbb song", 100, "ISRC2")],
               21: [trk(210, "Bbb other", 100, "ISRC3")], 30: [trk(300, "Ccc song", 100, "ISRC4")]}
     return conn, FakeCatalog(make_gate(), search, releases, tracks, trip_on_tracks=trip_on_tracks,
-                             fail_on_releases=fail_on_releases)
+                             fail_on_releases=fail_on_releases, fail_on_tracks=fail_on_tracks)
 
 
 def test_sync_all_budget_stop_is_enforced_inside_the_source():
@@ -501,3 +501,211 @@ def test_release_with_no_fetched_tracks_is_unknown_not_missing():
     sync_artist(conn, cat, row(conn, aid))
     states = {r["title"]: r["state"] for r in report.artist_report(conn, aid)["releases"]}
     assert states == {"Empty": "unknown", "Real": "missing"}
+
+
+# ---------------------------------------------------------------- hardening for a long run
+
+class ObjectNotFound(Exception):
+    """Same class name as tidalapi's."""
+
+
+class AuthenticationError(Exception):
+    """Same class name as tidalapi's."""
+
+
+def http_error(status, cls=requests.HTTPError):
+    e = cls(f"{status} Client Error: for url: https://api.tidal.com/v1/x?sessionId=SECRET")
+    e.response = type("R", (), {"status_code": status})()
+    return e
+
+
+def test_404_on_one_release_leaves_it_without_tracks_and_syncs_the_rest():
+    for gone in (ObjectNotFound("Object not found"), http_error(404)):
+        conn = mem()
+        aid = add_artist(conn, "Will", tidal_id=1, tidal_match="auto")
+        me = raw_artist(1, "Will")
+        pages = {("artists/1/albums", "EPSANDSINGLES", 0): [raw_album(10, "Ok", artists=[me], type="SINGLE"),
+                                                            raw_album(11, "Gone", artists=[me], type="SINGLE"),
+                                                            raw_album(12, "Fine", artists=[me], type="SINGLE")],
+                 ("albums/10/tracks", None, 0): [raw_track(100, "Ok", isrc="I1")],
+                 ("albums/12/tracks", None, 0): [raw_track(120, "Fine", isrc="I3")]}
+
+        class Session(FakeSession):
+            def _map_request(self, path, params, parse=None):
+                if path == "albums/11/tracks":
+                    self.requests.append((path, dict(params), parse))
+                    raise gone
+                return super()._map_request(path, params, parse)
+
+        session = Session(pages)
+        session.request.map_request = session._map_request
+        cat = TidalCatalog(session, make_gate(), CatalogCache(conn))
+        stats = sync_artist(conn, cat, row(conn, aid))
+        assert (stats["own"], stats["tracks"], stats["release_missing"]) == (3, 2, 1)
+        states = {r["title"]: r["state"] for r in report.artist_report(conn, aid)["releases"]}
+        assert states == {"Ok": "missing", "Gone": "unknown", "Fine": "missing"}
+        ev = conn.execute("SELECT subject, message, data_json FROM event_log "
+                          "WHERE kind = 'catalog.release_missing'").fetchall()
+        assert len(ev) == 1 and ev[0]["subject"] == "Will" and json.loads(ev[0]["data_json"]) == {"release_id": 11}
+        assert "SECRET" not in ev[0]["message"]
+        assert row(conn, aid)["catalog_synced_at"]
+        keys = {r[0] for r in conn.execute("SELECT key FROM catalog_cache")}
+        assert "tidal:tracks:11" not in keys and {"tidal:tracks:10", "tidal:tracks:12"} <= keys   # failure not cached
+        before = len([r for r in session.requests if r[0] == "albums/11/tracks"])
+        sync_artist(conn, cat, row(conn, aid))                       # a later sync asks again
+        assert len([r for r in session.requests if r[0] == "albums/11/tracks"]) == before + 1
+
+
+def test_other_errors_on_release_tracks_still_fail_the_artist():
+    conn, cat = three_artists(fail_on_tracks={20: http_error(500)})
+    res = sync_all(conn, cat)
+    assert [(a["artist"], a["status"]) for a in res["artists"]] == [("Aaa", "synced"), ("Bbb", "error"),
+                                                                    ("Ccc", "synced")]
+
+
+def test_auth_failures_stop_the_whole_run():
+    chained = RuntimeError("wrapped")
+    chained.__cause__ = http_error(401)
+    for err in (AuthenticationError("bad token"), http_error(401), chained):
+        conn, cat = three_artists(fail_on_releases={2: err})
+        res = sync_all(conn, cat)
+        assert (res["stopped"], res["synced"], res["errors"]) == ("auth", 1, 1), repr(err)
+        assert [a["artist"] for a in res["artists"]] == ["Aaa", "Bbb"]            # Ccc never attempted
+        msg = conn.execute("SELECT message FROM event_log WHERE kind = 'catalog.error'").fetchone()[0]
+        assert "SECRET" not in msg and "?" not in msg
+
+
+def test_403_is_a_per_artist_error_not_an_auth_stop():
+    wrapped = RuntimeError("wrapped")
+    wrapped.__cause__ = http_error(403)
+    for err in (http_error(403), wrapped):
+        conn, cat = three_artists(fail_on_releases={2: err})
+        res = sync_all(conn, cat)
+        assert (res["stopped"], res["synced"], res["errors"]) == (None, 2, 1), repr(err)
+        assert [(a["artist"], a["status"]) for a in res["artists"]] == [("Aaa", "synced"), ("Bbb", "error"),
+                                                                        ("Ccc", "synced")]
+
+
+def test_the_gate_decides_before_auth_classification():
+    """An AuthenticationError that was caused by a 429 (tidalapi's token_refresh) is a pause, never 'auth'."""
+    for err in (AuthenticationError("Authentication failed"), http_error(401)):
+        err.__cause__ = http_error(429)
+        conn, cat = three_artists(fail_on_releases={2: err})
+        res = sync_all(conn, cat)
+        assert (res["stopped"], res["errors"]) == ("paused", 0), repr(err)
+        assert conn.execute("SELECT COUNT(*) FROM event_log WHERE kind = 'catalog.error'").fetchone()[0] == 0
+    # and even if such an exception ever got past the gate, it is not an auth failure
+    from cadence.catalog.sync import _is_auth_failure
+    e = AuthenticationError("x")
+    e.__cause__ = http_error(429)
+    assert not _is_auth_failure(e) and _is_auth_failure(AuthenticationError("x"))
+
+
+def test_timeouts_stop_the_run_like_a_dead_connection():
+    for err in (requests.exceptions.ReadTimeout("Read timed out. (read timeout=30)"),
+                requests.exceptions.ConnectTimeout("Connect timed out"), TimeoutError("timed out")):
+        conn, cat = three_artists(fail_on_releases={2: err})
+        res = sync_all(conn, cat)
+        assert (res["stopped"], res["synced"], res["errors"]) == ("network", 1, 1), repr(err)
+        assert [a["artist"] for a in res["artists"]] == ["Aaa", "Bbb"]
+
+
+def test_ambiguous_and_none_artists_cost_nothing_on_later_runs_even_with_force():
+    conn = mem()
+    add_artist(conn, "Twin")
+    add_artist(conn, "Ghost")
+    cat = FakeCatalog(make_gate(), search={"Twin": [ArtistRef(5, "Twin"), ArtistRef(6, "Twin")],
+                                           "Ghost": [ArtistRef(7, "Someone")]})
+    first = sync_all(conn, cat)
+    assert (first["ambiguous"], first["unresolved"], cat.gate.calls) == (1, 1, 2)
+    for force in (False, True):
+        again = sync_all(conn, cat, force=force)
+        assert (again["ambiguous"], again["unresolved"], cat.gate.calls) == (1, 1, 2)
+        assert {a["artist"]: a for a in again["artists"]} == {
+            "Ghost": {"artist": "Ghost", "status": "unresolved"},
+            "Twin": {"artist": "Twin", "status": "ambiguous", "candidates": 2}}
+    assert [work_status(r, True) for r in conn.execute("SELECT * FROM artist ORDER BY norm_name")] == [
+        "unresolved", "ambiguous"]
+
+
+def test_force_bypasses_the_cache_for_that_run():
+    conn = mem()
+    aid = add_artist(conn, "Will", tidal_id=1, tidal_match="manual")
+    session = FakeSession({("artists/1/albums", None, 0): [raw_album(10, artists=[raw_artist(1, "Will")])],
+                           ("albums/10/tracks", None, 0): [raw_track(100)]})
+    cat = TidalCatalog(session, make_gate(), CatalogCache(conn))
+    sync_all(conn, cat)
+    n = len(session.requests)
+    assert n > 0 and cat.use_cache is True
+    assert sync_all(conn, cat)["skipped"] == 1 and len(session.requests) == n          # recently synced
+    sync_all(conn, cat, force=True)
+    assert cat.use_cache is False and len(session.requests) == 2 * n                   # not served from cache
+    sync_all(conn, cat, force=True)
+    assert len(session.requests) == 3 * n
+
+
+def test_clear_cache_all_and_per_artist():
+    conn = mem()
+    will = add_artist(conn, "Will", tidal_id=1, tidal_match="manual")
+    add_artist(conn, "Other", tidal_id=2, tidal_match="manual")
+    me, other = raw_artist(1, "Will"), raw_artist(2, "Other")
+    session = FakeSession({("artists/1/albums", None, 0): [raw_album(10, artists=[me])],
+                           ("albums/10/tracks", None, 0): [raw_track(100)],
+                           ("artists/2/albums", None, 0): [raw_album(20, artists=[other])],
+                           ("albums/20/tracks", None, 0): [raw_track(200)]})
+    cat = TidalCatalog(session, make_gate(), CatalogCache(conn))
+    sync_all(conn, cat)
+    conn.execute("INSERT INTO catalog_cache(key, body) VALUES ('keep:me', '{}')")
+    keys = lambda: sorted(r[0] for r in conn.execute("SELECT key FROM catalog_cache"))
+    assert clear_cache(conn, row(conn, will)) == 2                    # releases:1 + tracks:10
+    assert "tidal:releases:1" not in keys() and "tidal:tracks:10" not in keys()
+    assert {"tidal:releases:2", "tidal:tracks:20", "keep:me"} <= set(keys())
+    n = clear_cache(conn)
+    assert n == 2 and keys() == ["keep:me"]
+
+
+def test_clear_cache_per_artist_also_covers_releases_cached_but_never_written():
+    conn = mem()
+    will = add_artist(conn, "Will", tidal_id=1, tidal_match="manual")
+    session = FakeSession({("artists/1/albums", None, 0): [raw_album(10, artists=[raw_artist(1, "Will")]),
+                                                            raw_album(11, artists=[raw_artist(1, "Will")])],
+                           ("albums/10/tracks", None, 0): [raw_track(100)],
+                           ("albums/11/tracks", None, 0): [raw_track(110)]})
+    cat = TidalCatalog(session, make_gate(), CatalogCache(conn))
+    cat.artist_releases(1)                  # an interrupted sync: listing + one track list cached, nothing in the ledger
+    cat.release_tracks(10)
+    cat.release_tracks(11)
+    cat.release_tracks(99)                  # someone else's
+    assert clear_cache(conn, row(conn, will)) == 3
+    assert [r[0] for r in conn.execute("SELECT key FROM catalog_cache")] == ["tidal:tracks:99"]
+
+
+def test_every_own_release_404_is_an_artist_error_not_a_sync():
+    conn, cat = three_artists(fail_on_tracks={20: http_error(404), 21: ObjectNotFound("gone")})
+    res = sync_all(conn, cat)
+    assert [(a["artist"], a["status"]) for a in res["artists"]] == [("Aaa", "synced"), ("Bbb", "error"),
+                                                                    ("Ccc", "synced")]
+    assert (res["synced"], res["errors"], res["stopped"]) == (2, 1, None)
+    ev = conn.execute("SELECT subject, message FROM event_log WHERE kind = 'catalog.error'").fetchall()
+    assert len(ev) == 1 and ev[0]["subject"] == "Bbb"
+    assert "all 2 own release(s)" in ev[0]["message"] and "not marking the artist as synced" in ev[0]["message"]
+    assert "SECRET" not in ev[0]["message"] and "?" not in ev[0]["message"]
+    assert not conn.execute("SELECT catalog_synced_at FROM artist WHERE name = 'Bbb'").fetchone()[0]
+    assert conn.execute("SELECT COUNT(*) FROM release WHERE artist_id = 2").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM event_log WHERE kind = 'catalog.release_missing'").fetchone()[0] == 0
+
+
+def test_some_404s_are_counted_in_the_run_result():
+    conn, cat = three_artists(fail_on_tracks={21: http_error(404)})
+    res = sync_all(conn, cat)
+    assert (res["synced"], res["errors"], res["release_missing"]) == (3, 0, 1)
+    assert next(a for a in res["artists"] if a["artist"] == "Bbb")["release_missing"] == 1
+
+
+def test_gate_pause_and_budget_during_release_tracks_are_never_swallowed_as_404():
+    conn, cat = three_artists(trip_on_tracks=20)
+    assert sync_all(conn, cat)["stopped"] == "paused"
+    conn, cat = three_artists()
+    res = sync_all(conn, cat, max_calls=5)         # Aaa: 3 calls; Bbb: search (4), releases (5), tracks refused
+    assert res["stopped"] == "budget" and res["synced"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM release WHERE artist_id = 2").fetchone()[0] == 0

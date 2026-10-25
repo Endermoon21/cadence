@@ -58,6 +58,7 @@ def gated_call(source, fn, *args, **kwargs):
 class CatalogSource(Protocol):
     gate: Gate
     max_calls: int | None  # set by sync_all for the run; sources enforce it via gated_call
+    use_cache: bool  # set by sync_all (False with --force): fetch fresh, still write the cache
 
     def search_artists(self, name: str) -> list[ArtistRef]: ...
     def artist_releases(self, tidal_artist_id: int) -> list[ReleaseDTO]: ...

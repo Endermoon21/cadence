@@ -5,6 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import requests
+import requests.adapters
 import tidalapi
 import tidalapi.artist
 
@@ -14,11 +16,37 @@ from cadence.ledger.db import log_event
 from cadence.sources import base
 from cadence.sources.base import ArtistRef, ReleaseDTO, TrackDTO
 
+TIMEOUT = (10, 30)  # (connect, read) seconds; tidalapi's requests session has none
 RELEASE_PAGE = 50
 TRACK_PAGE = 100
 MAX_PAGES = 40  # hard cap per listing
 # Unfiltered bucket first: when a release shows up in several buckets the first one wins.
 RELEASE_FILTERS = (None, "EPSANDSINGLES", "COMPILATIONS")
+
+
+class _TimeoutAdapter(requests.adapters.HTTPAdapter):
+    """Transport hook for everything tidalapi sends (API calls, login, token refresh).
+
+    - Gives every request that has no timeout of its own a default one.
+    - Turns a 429 into requests.HTTPError(response=...) right here. tidalapi's token_refresh would
+      otherwise misread a 429 from the auth server as a JSON/KeyError/AuthenticationError and the gate
+      would never trip; with the HTTPError the gate's cause-chain 429 detection sees it on every path."""
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = TIMEOUT
+        resp = super().send(request, **kwargs)
+        if resp.status_code == 429:
+            raise requests.HTTPError("429 Too Many Requests", response=resp)
+        return resp
+
+
+def install_timeout(session) -> None:
+    """tidalapi calls session.request_session.request/post without a timeout, so a stalled connection
+    would hang forever. Mounting an adapter covers every call (requests, token refresh, login) and
+    leaves tidalapi untouched. See _TimeoutAdapter for the 429 handling."""
+    for prefix in ("https://", "http://"):
+        session.request_session.mount(prefix, _TimeoutAdapter())
 
 
 def load_session(token_path: str | Path) -> tidalapi.Session:
@@ -32,6 +60,7 @@ def load_session(token_path: str | Path) -> tidalapi.Session:
         return v["data"] if isinstance(v, dict) and "data" in v else v
 
     session = tidalapi.Session()
+    install_timeout(session)
     ok = session.load_oauth_session(get("token_type"), get("access_token"), get("refresh_token"))
     if not ok:
         raise RuntimeError(f"Tidal rejected the saved session in {token_path} "
@@ -122,14 +151,16 @@ def _unwrap(item: dict) -> dict:
 class TidalCatalog:
     """CatalogSource over a tidalapi session. Every network call goes through the gate and the call budget."""
 
-    def __init__(self, session, gate: Gate, cache: CatalogCache, max_calls: int | None = None):
+    def __init__(self, session, gate: Gate, cache: CatalogCache, max_calls: int | None = None,
+                 use_cache: bool = True):
         self.session = session
         self.gate = gate
         self.cache = cache
         self.max_calls = max_calls
+        self.use_cache = use_cache
 
     def _cached(self, key: str, fetch) -> list:
-        hit = self.cache.get(key)
+        hit = self.cache.get(key) if self.use_cache else None
         if hit is not None:
             return hit
         value = fetch()

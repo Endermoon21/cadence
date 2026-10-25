@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace as NS
 
 import pytest
+import requests
 
 from cadence.gate.bucket import GatePaused
 from cadence.ledger import db
@@ -225,6 +226,8 @@ def test_load_session_unwraps_values_and_never_writes(tmp_path, monkeypatch):
     seen = []
 
     class FakeLogin:
+        request_session = requests.Session()
+
         def load_oauth_session(self, *args):
             seen.append(args)
             return True
@@ -239,9 +242,137 @@ def test_load_session_rejected_or_incomplete_raises(tmp_path, monkeypatch):
     token = tmp_path / "token.json"
     token.write_text(json.dumps({"token_type": "Bearer", "access_token": "AT", "refresh_token": "RT"}))
     monkeypatch.setattr(tidal.tidalapi, "Session",
-                        lambda: NS(load_oauth_session=lambda *a: False))
+                        lambda: NS(request_session=requests.Session(),
+                                                      load_oauth_session=lambda *a: False))
     with pytest.raises(RuntimeError, match="rejected"):
         tidal.load_session(token)
     token.write_text(json.dumps({"token_type": "Bearer"}))
     with pytest.raises(RuntimeError, match="access_token"):
         tidal.load_session(token)
+
+
+def test_timeout_adapter_sets_a_default_and_respects_explicit_timeouts(monkeypatch):
+    sent = []
+    ok = NS(status_code=200)
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send",
+                        lambda self, request, **kw: sent.append(kw.get("timeout")) or ok)
+    adapter = tidal._TimeoutAdapter()
+    assert adapter.send(NS(), timeout=None) is ok
+    adapter.send(NS())
+    adapter.send(NS(), timeout=5)
+    assert sent == [tidal.TIMEOUT, tidal.TIMEOUT, 5]
+    assert tidal.TIMEOUT == (10, 30)
+
+
+def test_install_timeout_covers_requests_made_the_way_tidalapi_makes_them(monkeypatch):
+    sent = []
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send",
+                        lambda self, request, **kw: sent.append(kw["timeout"]) or (_ for _ in ()).throw(
+                            requests.exceptions.ReadTimeout("slow")))
+    s = NS(request_session=requests.Session())
+    tidal.install_timeout(s)
+    for method in (lambda: s.request_session.request("GET", "https://api.tidal.com/v1/x", params={"a": 1}),
+                   lambda: s.request_session.post("https://auth.tidal.com/v1/oauth2/token", {"b": 2}),
+                   lambda: s.request_session.get("http://example.invalid/")):
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            method()
+    assert sent == [(10, 30)] * 3                                  # no network: the adapter was stubbed
+
+
+def test_load_session_installs_the_timeout_before_logging_in(tmp_path, monkeypatch):
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps({"token_type": "Bearer", "access_token": "AT", "refresh_token": "RT"}))
+    adapters = []
+
+    class FakeLogin:
+        request_session = requests.Session()
+
+        def load_oauth_session(self, *args):
+            adapters.append(type(self.request_session.get_adapter("https://api.tidal.com")).__name__)
+            return True
+
+    monkeypatch.setattr(tidal.tidalapi, "Session", FakeLogin)
+    tidal.load_session(token)
+    assert adapters == ["_TimeoutAdapter"]
+
+
+def test_use_cache_false_refetches_but_still_refreshes_the_cache():
+    s = FakeSession({("albums/1/tracks", None, 0): [raw_track(1)]})
+    cat, gate, conn = catalog(s)
+    cat.release_tracks(1)
+    cat.use_cache = False
+    cat.release_tracks(1)
+    assert gate.calls == 2
+    conn.execute("UPDATE catalog_cache SET body = '{\"dto\": \"TrackDTO\", \"items\": []}'")
+    cat.use_cache = True
+    assert len(cat.release_tracks(1)) == 0                       # served from cache again
+    cat.use_cache = False
+    assert len(cat.release_tracks(1)) == 1
+    assert len(cat.release_tracks(1)) == 1 and gate.calls == 4
+    cat.use_cache = True
+    assert len(cat.release_tracks(1)) == 1                       # the forced fetch refreshed the entry
+
+
+def response(status, body=b"{}", headers=None, url="https://auth.tidal.com/v1/oauth2/token"):
+    r = requests.Response()
+    r.status_code, r._content, r.url = status, body, url
+    r.headers.update(headers or {})
+    return r
+
+
+def test_adapter_raises_http_error_on_429_only(monkeypatch):
+    answers = iter([response(200), response(401), response(404), response(500), response(429, headers={"Retry-After": "120"})])
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", lambda self, request, **kw: next(answers))
+    adapter = tidal._TimeoutAdapter()
+    for status in (200, 401, 404, 500):
+        assert adapter.send(NS()).status_code == status          # everything else is left to tidalapi
+    with pytest.raises(requests.HTTPError) as ei:
+        adapter.send(NS())
+    assert ei.value.response.status_code == 429 and ei.value.response.headers["Retry-After"] == "120"
+    assert "?" not in str(ei.value)
+
+
+def expired_token_session(monkeypatch, auth_status):
+    """A real tidalapi.Session (no network: the transport is stubbed) whose API answers 'token expired'
+    and whose auth server answers `auth_status` to the refresh POST."""
+    import tidalapi
+    calls = []
+
+    def send(self, request, **kw):
+        calls.append((request.method, request.url.split("?")[0]))
+        if request.method == "POST":                                   # token_refresh
+            return response(auth_status, b'{"error": "x"}', {"Retry-After": "300"})
+        return response(401, b'{"userMessage": "The token has expired."}', url=request.url)
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    session = tidalapi.Session()
+    session.token_type, session.access_token, session.refresh_token = "Bearer", "AT", "RT"
+    session.session_id, session.country_code = "sid", "US"
+    tidal.install_timeout(session)
+    return session, calls
+
+
+def test_429_from_the_auth_server_during_a_token_refresh_trips_the_gate(monkeypatch):
+    session, calls = expired_token_session(monkeypatch, 429)
+    saved = {}
+    gate = make_gate(save_state=lambda k, v: saved.update({k: v}))
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cat = TidalCatalog(session, gate, CatalogCache(conn))
+    with pytest.raises(GatePaused) as ei:
+        cat.artist_releases(7)
+    assert isinstance(ei.value.__cause__, requests.HTTPError)
+    assert [m for m, _ in calls] == ["GET", "POST"]                    # the refresh really was attempted
+    assert "gate.tidal.paused_until" in saved and (ei.value.until - gate._now()).total_seconds() == 300
+    assert conn.execute("SELECT COUNT(*) FROM catalog_cache").fetchone()[0] == 0
+
+
+def test_without_the_transport_hook_the_same_429_would_not_trip_the_gate(monkeypatch):
+    """Documents why the adapter raises: tidalapi alone turns this 429 into a KeyError."""
+    session, _ = expired_token_session(monkeypatch, 429)
+    monkeypatch.setattr(tidal._TimeoutAdapter, "send", requests.adapters.HTTPAdapter.send)
+    cat = TidalCatalog(session, make_gate(), CatalogCache(db.connect(":memory:")))
+    cat.cache.conn.executescript("CREATE TABLE catalog_cache(key TEXT PRIMARY KEY, fetched_at TEXT, body TEXT)")
+    with pytest.raises(Exception) as ei:
+        cat.artist_releases(7)
+    assert not isinstance(ei.value, GatePaused)

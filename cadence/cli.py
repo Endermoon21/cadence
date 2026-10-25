@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cadence import report
 from cadence.catalog.link import link_files
-from cadence.catalog.sync import sync_all
+from cadence.catalog.sync import clear_cache, pending_work, sync_all
 from cadence.gate.bucket import Gate, GatePaused
 from cadence.identity.normalize import norm_artist
 from cadence.ledger import db
@@ -57,7 +57,8 @@ def _line(e: dict) -> str:
     if e["status"] == "synced":
         return (f"{e['artist']}: synced, {e['own']} own + {e['appears_on']} appears-on release(s), "
                 f"{e['tracks']} track(s), {e['recordings_new']} new recording(s)"
-                + (f", {e['hidden']} no longer listed" if e["hidden"] else ""))
+                + (f", {e['hidden']} no longer listed" if e["hidden"] else "")
+                + (f", {e['release_missing']} release(s) without tracks (404)" if e["release_missing"] else ""))
     if e["status"] == "ambiguous":
         return (f"{e['artist']}: ambiguous: {e['candidates']} candidates, "
                 f"run `cadence artist set-tidal \"{e['artist']}\" ID`")
@@ -76,6 +77,13 @@ def cmd_sync_catalog(args, conn) -> int:
     if not args.all and not args.artist:
         print("sync-catalog: give --artist NAME (repeatable) or --all", file=sys.stderr)
         return 2
+    work = pending_work(conn, None if args.all else args.artist, args.force)
+    if work["due"] == 0:  # decide before logging in: no work means no Tidal calls at all
+        for n in work["unknown"]:
+            print(f"{n}: not in the ledger (import-legacy first)")
+        print(f"sync-catalog: nothing due ({work['skipped']} synced within 7 days, {work['ambiguous']} "
+              f"ambiguous, {work['unresolved']} unresolved); not contacting Tidal")
+        return 0
     gate = _gate(conn, args.interval, args.burst)
     until = gate.paused_until()
     if until:
@@ -96,12 +104,28 @@ def cmd_sync_catalog(args, conn) -> int:
     for n in res["unknown"]:
         print(f"{n}: not in the ledger (import-legacy first)")
     print(f"sync-catalog: {res['synced']} synced, {res['skipped']} skipped, {res['unresolved']} unresolved, "
-          f"{res['ambiguous']} ambiguous, {res['errors']} errors, {res['calls']} gate calls, "
+          f"{res['ambiguous']} ambiguous, {res['errors']} errors, {res['release_missing']} release(s) "
+          f"without tracks, {res['calls']} gate calls, "
           f"stopped={res['stopped']}")
     if res["stopped"] == "paused":
         print(f"gate paused until {res['until']}")
         return EXIT_PAUSED
-    return 1 if res["stopped"] == "network" else 0
+    if res["stopped"] == "auth":
+        print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.",
+              file=sys.stderr)
+    return 1 if res["stopped"] in ("network", "auth") else 0
+
+
+def cmd_cache_clear(args, conn) -> int:
+    row = None
+    if args.artist:
+        row = _artist_by_name(conn, args.artist)
+        if row is None or row["tidal_id"] is None:
+            print(f"cache-clear: '{args.artist}' is not in the ledger or has no Tidal id", file=sys.stderr)
+            return 1
+    n = clear_cache(conn, row)
+    print(f"cache-clear: {n} cached response(s) deleted" + (f" for {row['name']}" if row else ""))
+    return 0
 
 
 def cmd_link(args, conn) -> int:
@@ -189,8 +213,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-calls", type=int, default=400)
     s.add_argument("--interval", type=_positive_float, default=2.0)
     s.add_argument("--burst", type=_at_least_one, default=3)
-    s.add_argument("--force", action="store_true")
+    s.add_argument("--force", action="store_true", help="re-sync artists synced within 7 days, ignoring the cache")
     s.set_defaults(fn=cmd_sync_catalog)
+
+    s = sub.add_parser("cache-clear", help="forget cached Tidal responses")
+    s.add_argument("--artist", metavar="NAME")
+    s.set_defaults(fn=cmd_cache_clear)
 
     s = sub.add_parser("link", help="match files to recordings")
     s.add_argument("--artist")
