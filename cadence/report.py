@@ -122,11 +122,16 @@ def artist_report(conn: sqlite3.Connection, artist_id: int) -> dict:
             for cid in scope if len(files.get(cid, ())) > 1]
     appears_on = conn.execute("SELECT COUNT(*) FROM release WHERE artist_id = ? AND role = 'appears_on'",
                               (artist_id,)).fetchone()[0]
-    return {"artist_id": artist_id, "artist": artist["name"], "tidal_id": artist["tidal_id"],
-            "tidal_match": artist["tidal_match"], "releases": _release_rows(own, owned),
-            "release_editions": sum(len(eds) for eds in own.groups.values()),
-            **_counts(own, owned), "missing_recordings": missing,
-            "unmatched_files": unmatched, "duplicates": dups, "appears_on": appears_on}
+    lossy = [r[0] for r in conn.execute("SELECT path FROM file WHERE artist_id = ? AND lossy = 1 ORDER BY path",
+                                        (artist_id,))]
+    out = {"artist_id": artist_id, "artist": artist["name"], "tidal_id": artist["tidal_id"],
+           "tidal_match": artist["tidal_match"], "releases": _release_rows(own, owned),
+           "release_editions": sum(len(eds) for eds in own.groups.values()),
+           **_counts(own, owned), "missing_recordings": missing,
+           "unmatched_files": unmatched, "duplicates": dups, "appears_on": appears_on}
+    if lossy:
+        out["lossy_files"] = lossy
+    return out
 
 
 def library_summary(conn: sqlite3.Connection) -> list[dict]:
@@ -137,12 +142,14 @@ def library_summary(conn: sqlite3.Connection) -> list[dict]:
         c = _counts(own, owned)
         unmatched = conn.execute("SELECT COUNT(*) FROM file WHERE artist_id = ? AND match = 'unmatched'",
                                  (a["id"],)).fetchone()[0]
+        lossy = conn.execute("SELECT COUNT(*) FROM file WHERE artist_id = ? AND lossy = 1",
+                             (a["id"],)).fetchone()[0]
         rows.append({"artist_id": a["id"], "artist": a["name"], "tidal_match": a["tidal_match"],
                      "own_releases": len(own.groups), "own_editions": sum(len(e) for e in own.groups.values()),
                      "recordings_owned": c["recordings_owned"], "recordings_total": c["recordings_total"],
                      "missing": c["recordings_total"] - c["recordings_owned"],
                      "missing_main": c["missing_main"], "missing_variant": c["missing_variant"],
-                     "unmatched_files": unmatched})
+                     "unmatched_files": unmatched, "lossy": lossy})
     return rows
 
 
@@ -171,6 +178,9 @@ def format_artist_report(d: dict) -> str:
     if d["unmatched_files"]:
         lines.append(f"  unmatched files ({len(d['unmatched_files'])}):")
         lines += [f"    {f['path']}" for f in d["unmatched_files"]]
+    if d.get("lossy_files"):
+        lines.append(f"  lossy files ({len(d['lossy_files'])}):")
+        lines += [f"    {p}" for p in d["lossy_files"]]
     if d["duplicates"]:
         lines.append(f"  duplicates ({len(d['duplicates'])}):")
         for dup in d["duplicates"]:
@@ -183,9 +193,9 @@ def format_summary(rows: list[dict]) -> str:
     if not rows:
         return "no artists in the ledger"
     w = min(40, max(len(r["artist"]) for r in rows))
-    lines = [f"{'artist':<{w}}  {'tidal':<9} {'rel':>4} {'owned':>11} {'missing':>7} {'+var':>5} {'unmatched':>9}"]
+    lines = [f"{'artist':<{w}}  {'tidal':<9} {'rel':>4} {'owned':>11} {'missing':>7} {'+var':>5} {'unmatched':>9} {'lossy':>5}"]
     for r in rows:
         lines.append(f"{r['artist'][:w]:<{w}}  {r['tidal_match']:<9} {r['own_releases']:>4} "
                      f"{r['recordings_owned']:>5}/{r['recordings_total']:<5} {r['missing_main']:>7} "
-                     f"{r['missing_variant']:>5} {r['unmatched_files']:>9}")
+                     f"{r['missing_variant']:>5} {r['unmatched_files']:>9} {r['lossy']:>5}")
     return "\n".join(lines)

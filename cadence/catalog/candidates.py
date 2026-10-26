@@ -10,12 +10,15 @@ from dataclasses import dataclass
 
 from cadence.catalog.sync import _is_auth_failure, _is_dead_connection, _safe_message, select_artists
 from cadence.gate.bucket import GatePaused
-from cadence.identity.normalize import split_title
+from cadence.identity.normalize import fold, split_title
 from cadence.sources.base import BudgetExceeded, CatalogSource, ReleaseDTO
+from cadence.sources.musicbrainz import MusicBrainz
 
 TIDAL_ARTIST_URL = "https://tidal.com/artist/{}"
 MIN_FILE_LEAD = 2     # a winner must lead the runner-up by this many owned files ...
 MIN_ALBUM_LEAD = 1    # ... or by this many owned albums
+MB_MIN_OVERLAP = 2    # MusicBrainz tiebreak: the pick must share this many titles ...
+MB_MIN_LEAD = 2       # ... and lead the other tied candidates by this many
 SHOWN_LIBRARY_ALBUMS = 12
 SHOWN_TITLES = 3
 
@@ -91,7 +94,39 @@ def _recommend(ranked: list[dict]) -> int | None:
     return None
 
 
-def score_candidates(conn: sqlite3.Connection, catalog: CatalogSource, artist_row, max_candidates: int = 8) -> dict:
+def _mb_tiebreak(res: dict, mb: MusicBrainz, bases_by_id: dict[int, set[str]]) -> int | None:
+    """Add `mb_overlap`/`mb_total` to every candidate and sets res['mb']. Returns a winner only among the
+    candidates tied with the best one on library evidence, so MusicBrainz can never outvote owned albums."""
+    res["mb"] = {"artist": None, "mbid": None, "release_groups": 0, "skipped": None, "decided": False}
+    try:
+        want = fold(res["artist"])
+        exact = [a for a in mb.search_artists(res["artist"]) if fold(a["name"]) == want]
+        if not exact:
+            res["mb"]["skipped"] = "no exact artist name match on MusicBrainz"
+            return None
+        artist = max(exact, key=lambda a: a["score"])  # max() keeps the first of equal scores
+        titles = mb.release_group_titles(artist["mbid"])
+    except Exception as exc:
+        res["mb"]["skipped"] = f"lookup failed: {type(exc).__name__}: {_safe_message(exc)}"
+        return None
+    res["mb"].update(artist=artist["name"], mbid=artist["mbid"], release_groups=len(titles))
+    mb_bases = {split_title(t).base for t in titles}
+    for c in res["candidates"]:
+        c["mb_overlap"], c["mb_total"] = len(bases_by_id[c["id"]] & mb_bases), len(bases_by_id[c["id"]])
+    if not res["candidates"]:
+        return None
+    top = res["candidates"][0]
+    tied = sorted((c for c in res["candidates"] if (c["matched_files"], c["matched_library_albums"])
+                   == (top["matched_files"], top["matched_library_albums"])), key=lambda c: -c["mb_overlap"])
+    if len(tied) > 1 and tied[0]["mb_overlap"] >= MB_MIN_OVERLAP \
+            and tied[0]["mb_overlap"] - tied[1]["mb_overlap"] >= MB_MIN_LEAD:
+        res["mb"]["decided"] = True
+        return tied[0]["id"]
+    return None
+
+
+def score_candidates(conn: sqlite3.Connection, catalog: CatalogSource, artist_row, max_candidates: int = 8,
+                     mb: MusicBrainz | None = None) -> dict:
     """Score each stored candidate of one artist. Uses catalog.artist_releases only (gated and cached like sync).
 
     `stopped` is 'paused' | 'budget' | 'auth' | 'network' when the run had to end early; what was gathered is
@@ -100,12 +135,14 @@ def score_candidates(conn: sqlite3.Connection, catalog: CatalogSource, artist_ro
     res: dict = {"artist": artist_row["name"], "library_albums": [{"title": a.title, "files": a.files}
                                                                   for a in lib.values()],
                  "library_files": sum(a.files for a in lib.values()), "candidates": [], "truncated": 0,
-                 "recommendation": None, "note": None, "skipped": None, "stopped": None, "until": None}
+                 "recommendation": None, "note": None, "skipped": None, "stopped": None, "until": None,
+                 "mb": None}
     cands = parse_candidates(artist_row["tidal_candidates"])
     if not cands:
         res["skipped"] = "no usable candidates stored for this artist"
         return res
     res["truncated"] = max(0, len(cands) - max_candidates)
+    bases_by_id: dict[int, set[str]] = {}
     for cand in cands[:max_candidates]:
         try:
             releases = catalog.artist_releases(cand["id"])
@@ -128,10 +165,13 @@ def score_candidates(conn: sqlite3.Connection, catalog: CatalogSource, artist_ro
         other = conn.execute("SELECT name FROM artist WHERE tidal_id = ? AND id != ?",
                              (cand["id"], artist_row["id"])).fetchone()
         res["candidates"].append(_score(cand, releases, lib, other["name"] if other else None))
+        bases_by_id[cand["id"]] = {split_title(r.title, r.version).base for r in releases}
     res["candidates"].sort(key=lambda c: (-c["matched_files"], -c["matched_library_albums"]))
     if res["stopped"] or any(c["error"] for c in res["candidates"]):
         return res
     winner = _recommend(res["candidates"])
+    if winner is None and mb is not None:  # tiebreaker only: a clear library winner is never second-guessed
+        winner = _mb_tiebreak(res, mb, bases_by_id)
     taken = next((c["taken_by"] for c in res["candidates"] if c["id"] == winner), None)
     if taken:
         res["note"] = f"best match {winner} already belongs to '{taken}'"
@@ -148,11 +188,11 @@ def pending_artists(conn: sqlite3.Connection, names: list[str] | None) -> tuple[
 
 
 def run_candidates(conn: sqlite3.Connection, catalog: CatalogSource, rows: list, max_candidates: int = 8,
-                   progress: Callable[[dict], None] | None = None) -> dict:
+                   progress: Callable[[dict], None] | None = None, mb: MusicBrainz | None = None) -> dict:
     """score_candidates for each row; ends the run at the first stop (paused / budget / auth / network)."""
     out: dict = {"artists": [], "stopped": None, "until": None}
     for row in rows:
-        res = score_candidates(conn, catalog, row, max_candidates)
+        res = score_candidates(conn, catalog, row, max_candidates, mb)
         out["artists"].append(res)
         if progress:
             progress(res)
@@ -189,8 +229,14 @@ def format_result(res: dict) -> str:
         eg = _titles(c["matched_titles"] or c["sample_titles"])
         lines.append(f"{head}  releases={c['releases']}  library-albums matched {c['matched_library_albums']}/"
                      f"{n_albums} (files {c['matched_files']}/{res['library_files']})"
-                     + (f"  e.g. {eg}" if eg else "") + f"  {c['url']}"
+                     + (f"  e.g. {eg}" if eg else "")
+                     + (f"  mb-overlap {c['mb_overlap']}/{c['mb_total']}" if "mb_overlap" in c else "")
+                     + f"  {c['url']}"
                      + (f"  (id already used by '{c['taken_by']}')" if c["taken_by"] else ""))
+    if res["mb"]:
+        m = res["mb"]
+        lines.append(f"  musicbrainz: skipped, {m['skipped']}" if m["skipped"] else
+                     f"  musicbrainz: {m['artist']} ({m['mbid']}), {m['release_groups']} release group(s)")
     if res["truncated"]:
         lines.append(f"  ({res['truncated']} more candidate(s) not checked; raise max_candidates)")
     if res["stopped"]:
@@ -198,7 +244,8 @@ def format_result(res: dict) -> str:
     elif any(c["error"] for c in res["candidates"]):
         lines.append("  -> some candidates failed to load, no suggestion")
     elif res["recommendation"] is not None:
-        lines.append(f"  -> suggest: cadence artist set-tidal {_quote(res['artist'])} {res['recommendation']}")
+        lines.append(f"  -> suggest: cadence artist set-tidal {_quote(res['artist'])} {res['recommendation']}"
+                     + (" (musicbrainz tiebreak)" if res["mb"] and res["mb"]["decided"] else ""))
     else:
         lines.append(f"  -> {res['note'] or 'no clear winner'}, check the links")
     return "\n".join(lines)

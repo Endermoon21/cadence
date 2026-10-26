@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cadence.identity.normalize import is_various, norm_artist
+from cadence.ledger.quality import facts
 
 # scan key -> file column
 _FIELDS = {
@@ -16,7 +17,7 @@ _FIELDS = {
     "album": "tag_album", "track": "tag_track", "disc": "tag_disc", "date": "tag_date",
     "isrc": "tag_isrc", "mb_track": "tag_mb_track",
 }
-_COLS = list(_FIELDS.values())
+_COLS = [*_FIELDS.values(), "lossy", "quality_received"]  # derived; quality_requested stays NULL here
 # recording_id / match / match_score are deliberately absent from the UPDATE list (see the reset in
 # import_scan for the one case where a changed artist makes an existing link stale).
 _UPSERT = (
@@ -62,7 +63,8 @@ def import_scan(conn: sqlite3.Connection, jsonl_path: str | Path) -> dict:
             existed = conn.execute("SELECT artist_id, match FROM file WHERE path = ?", (row["path"],)).fetchone()
             artist_id = _artist_id(conn, row, stats)
             conn.execute(_UPSERT, (row["path"], artist_id,
-                                   *(_value(row, k) for k in _FIELDS), now))
+                                   *(_value(row, k) for k in _FIELDS),
+                                   *facts(row.get("codec"), row.get("sr"), row.get("bits"), row.get("br")), now))
             if existed and existed["artist_id"] != artist_id and existed["match"] != "manual":
                 # a link to another artist's recording is stale now (manual links are never touched)
                 conn.execute("UPDATE file SET recording_id = NULL, match = 'unmatched', match_score = NULL "

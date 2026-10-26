@@ -18,6 +18,9 @@ from cadence.gate.bucket import Gate, GatePaused
 from cadence.identity.normalize import norm_artist
 from cadence.ledger import db
 from cadence.ledger.legacy import import_scan
+from cadence.ledger.quality import backfill_quality, format_summary as format_quality, quality_summary
+from cadence.sources.musicbrainz import MusicBrainz
+from cadence.tags.albumartist import audit_albumartist, format_audit
 
 EXIT_PAUSED = 3
 DEFAULT_DB = Path(__file__).resolve().parents[1] / "data" / "cadence.db"  # project root, not the cwd
@@ -139,8 +142,9 @@ def cmd_candidates(args, conn) -> int:
     catalog, code = _tidal_catalog(conn, args, "candidates")
     if catalog is None:
         return code
+    mb = MusicBrainz(conn) if args.musicbrainz else None
     res = run_candidates(conn, catalog, rows, progress=None if args.json else
-                         lambda r: print(format_result(r) + "\n", flush=True))
+                         lambda r: print(format_result(r) + "\n", flush=True), mb=mb)
     if args.json:
         print(json.dumps({**res, "notes": notes}, indent=2))
     else:
@@ -154,6 +158,19 @@ def cmd_candidates(args, conn) -> int:
         print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.",
               file=sys.stderr)
     return 1 if res["stopped"] in ("network", "auth") else 0
+
+
+def cmd_quality(args, conn) -> int:
+    filled = backfill_quality(conn)  # derived from stored codec facts; no file IO
+    conn.commit()
+    print(f"quality: {filled} file(s) filled in from stored codec facts" if filled else "quality: nothing to fill in")
+    print(format_quality(quality_summary(conn)))
+    return 0
+
+
+def cmd_audit_tags(args, conn) -> int:
+    print(format_audit(audit_albumartist(conn)))  # read-only: nothing is written to files or the ledger
+    return 0
 
 
 def cmd_cache_clear(args, conn) -> int:
@@ -304,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=_positive_float, default=2.0)
     s.add_argument("--burst", type=_at_least_one, default=3)
     s.add_argument("--json", action="store_true")
+    s.add_argument("--musicbrainz", action="store_true", help="tiebreak ties with MusicBrainz release groups (network)")
     s.set_defaults(fn=cmd_candidates)
 
     s = sub.add_parser("cache-clear", help="forget cached Tidal responses")
@@ -341,6 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = al.add_parser("remove", help="forget an alias")
     s.add_argument("alias")
     s.set_defaults(fn=cmd_alias_remove)
+
+    sub.add_parser("quality", help="lossless / lossy file counts").set_defaults(fn=cmd_quality)
+    sub.add_parser("audit-tags", help="album-artist tags that a primary-artist rule would change (read-only)"
+                   ).set_defaults(fn=cmd_audit_tags)
 
     sub.add_parser("gate-status", help="show whether the Tidal gate is paused").set_defaults(fn=cmd_gate_status)
     return p

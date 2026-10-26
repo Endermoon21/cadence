@@ -98,6 +98,10 @@ event_log(...)                                -- what happened and why; powers t
 
 **Discovery:** ⚠ prefer Tidal's own similar-artists data via tidalapi (needs no extra API key) plus "followed artists' related", shown in the UI as suggestions you can follow in one tap. Last.fm / ListenBrainz are optional later add-ons.
 
+### Folder naming (decided 2026-10-26)
+
+Keep `Artist/Album/NN - Title.ext`. Reasons: the FiiO card scripts (`tidal-card-sync`, `fiio-format-card`) depend on it, the 5,210 existing files already use it, and Jellyfin / Navidrome scan that layout fine. A `[Year]` prefix on the album folder was considered and deferred (it would mean renaming every album folder and touching the card scripts for no scanner benefit). The template lives in one place, `cadence/ledger/naming.py` (`album_dir`, `track_file`); only characters exFAT/macOS cannot hold are changed. Nothing in the library has been renamed.
+
 ### 5a. FiiO card sync (built in)
 
 **Destination tags (user requirement, 2026-10-11).** Every album you request carries a destination: **Server**, **FiiO**, or **both**. You choose it when you ask for the album (checkboxes in the UI), or it falls back to a per-artist default; you can change it later, singly or in bulk. Anything tagged FiiO is the **"set aside" list**, and it is copied to the card **automatically whenever the card is plugged in**.
