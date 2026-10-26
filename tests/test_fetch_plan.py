@@ -21,7 +21,7 @@ def test_owned_clusters_are_skipped_even_when_owned_through_another_member():
     for n, (r, t) in enumerate([(r1, "One"), (r2, "Two"), (r3, "Three")], 1):
         add_track(conn, rel, r, n, t, 1000 + n)
     add_file(conn, "x/y/01.flac", a, r1)  # owns the cluster {r1, r2} through its non-canonical member
-    assert titles(plan_missing(conn)) == ["Three"]
+    assert titles(plan_missing(conn, scope="all")) == ["Three"]
 
 
 def test_variants_only_with_include_variants():
@@ -29,8 +29,8 @@ def test_variants_only_with_include_variants():
     add_track(conn, rel, add_recording(conn, a, "Song"), 1, "Song", 1)
     add_track(conn, rel, add_recording(conn, a, "Song (Instrumental)", variant="instrumental"), 2,
               "Song (Instrumental)", 2)
-    assert titles(plan_missing(conn)) == ["Song"]
-    assert titles(plan_missing(conn, include_variants=True)) == ["Song", "Song (Instrumental)"]
+    assert titles(plan_missing(conn, scope="all")) == ["Song"]
+    assert titles(plan_missing(conn, include_variants=True, scope="all")) == ["Song", "Song (Instrumental)"]
 
 
 def test_canonical_recordings_track_is_chosen_over_the_original_and_compilations():
@@ -45,10 +45,10 @@ def test_canonical_recordings_track_is_chosen_over_the_original_and_compilations
     add_track(conn, old, orig, 5, "Heart of Gold", 501)
     add_track(conn, comp, remaster, 1, "Heart of Gold (2009 Remaster)", 503)
     add_track(conn, new, remaster, 5, "Heart of Gold (2009 Remaster)", 502)
-    [item] = plan_missing(conn)
-    assert (item.tidal_track_id, item.recording_id, item.release, item.tidal_release_id) == (502, remaster, "Harvest (2009 Remaster)", 102)
-    assert item.target_rel == "Neil Young/Harvest (2009 Remaster)/05 - Heart of Gold (2009 Remaster).flac"
-    assert plan_missing(conn, ext=".m4a")[0].target_rel.endswith(".m4a")
+    [item] = plan_missing(conn, scope="all")
+    assert (item.tidal_track_id, item.recording_id, item.release, item.tidal_release_id) == (502, remaster, "Harvest", 102)
+    assert item.target_rel == "Neil Young/Harvest/05 - Heart of Gold.flac"
+    assert plan_missing(conn, ext=".m4a", scope="all")[0].target_rel.endswith(".m4a")
 
 
 def test_item_fields_and_unusable_tracks():
@@ -58,7 +58,7 @@ def test_item_fields_and_unusable_tracks():
     add_track(conn, rel, add_recording(conn, a, "No Tidal id"), 5, "No Tidal id", None)
     unavailable = add_track(conn, rel, add_recording(conn, a, "Gone"), 6, "Gone", 8)
     conn.execute("UPDATE track SET available = 0 WHERE id = ?", (unavailable,))
-    [i] = plan_missing(conn)
+    [i] = plan_missing(conn, scope="all")
     assert (i.artist, i.release, i.disc, i.number, i.title, i.tidal_track_id, i.duration_s, i.isrc, i.dest) == \
         ("Neil Young", "Harvest", 2, 4, "Old Man (Live)", 7, 203, "USRE17200012", "server")
     assert i.target_rel == "Neil Young/Harvest/04 - Old Man (Live).flac"
@@ -70,7 +70,7 @@ def test_artists_without_a_resolved_tidal_match_are_skipped():
         a = add_artist(conn, name, tidal_id={"pending": 11, "ambiguous": 12, "manual": 13}[match], match=match)
         add_track(conn, add_release(conn, a, f"{name} LP", a), add_recording(conn, a, f"{name} Song"), 1,
                   f"{name} Song", 100 + a)
-    assert titles(plan_missing(conn)) == ["Manual Song"]
+    assert titles(plan_missing(conn, scope="all")) == ["Manual Song"]
 
 
 def test_scope_by_artist_and_release_and_destination():
@@ -80,8 +80,92 @@ def test_scope_by_artist_and_release_and_destination():
     add_track(conn, other, add_recording(conn, a, "B"), 1, "B", 2)
     b = add_artist(conn, "Someone Else", tidal_id=2)
     add_track(conn, add_release(conn, b, "Elsewhere", 300), add_recording(conn, b, "C"), 1, "C", 3)
-    assert titles(plan_missing(conn, artist_id=a)) == ["B", "A"]  # ordered by release date
+    assert titles(plan_missing(conn, artist_id=a, scope="all")) == ["B", "A"]  # ordered by release date
     assert titles(plan_missing(conn, release_id=other)) == ["B"]
     conn.execute("INSERT INTO want(artist_id, dest) VALUES (?, 'both')", (a,))
     conn.execute("INSERT INTO want(release_id, dest) VALUES (?, 'fiio')", (other,))
-    assert {i.title: i.dest for i in plan_missing(conn)} == {"A": "both", "B": "fiio", "C": "server"}
+    assert {i.title: i.dest for i in plan_missing(conn, scope="all")} == {"A": "both", "B": "fiio", "C": "server"}
+
+
+# ---- scope, folder naming, near-duplicates ----
+
+from cadence.fetch.plan import strip_markers  # noqa: E402
+
+
+def test_strip_markers_only_removes_remaster_and_edition_wording():
+    assert strip_markers("I've Been Waiting for You (2009 Remaster)") == "I've Been Waiting for You"
+    assert strip_markers("Round & Round (It Won't Be Long) [2009 Remaster]") == "Round & Round (It Won't Be Long)"
+    assert strip_markers("Heart of Gold - Remastered 2009") == "Heart of Gold"
+    assert strip_markers("Decade (2017 Remaster)", release=True) == "Decade"
+    assert strip_markers("After The Gold Rush (50th Anniversary)", release=True) == "After The Gold Rush"
+    assert strip_markers("Old Man (Live at Massey Hall)") == "Old Man (Live at Massey Hall)"
+    assert strip_markers("(Don't Fear) The Reaper") == "(Don't Fear) The Reaper"
+    assert strip_markers("Remastered") == "Remastered"  # never an empty name
+
+
+def scoped():
+    """Neil Young: Decade (partly owned, existing folder) and Lonely Album (nothing owned)."""
+    conn = ledger()
+    a = add_artist(conn)
+    old = add_release(conn, a, "Decade", 10, date="1977-10-28")
+    new = add_release(conn, a, "Decade (2017 Remaster)", 11, date="2017-01-01")
+    conn.execute("UPDATE release SET group_key = 'album|decade' WHERE id IN (?, ?)", (old, new))
+    have = add_recording(conn, a, "Sugar Mountain")
+    want = add_recording(conn, a, "Cowgirl in the Sand (2017 Remaster)", dur=600)
+    add_track(conn, old, have, 1, "Sugar Mountain", 101)
+    add_track(conn, new, have, 1, "Sugar Mountain", 111)
+    add_track(conn, new, want, 2, "Cowgirl in the Sand", 112, version="2017 Remaster", dur=600)
+    add_file(conn, "Neil Young/Decade/01 - Sugar Mountain.flac", a, have)
+    lonely = add_release(conn, a, "Lonely Album: Part 1 (Deluxe Edition)", 20, date="2020-01-01")
+    add_track(conn, lonely, add_recording(conn, a, "Nobody Home (2020 Remaster)"), 3, "Nobody Home", 201,
+              version="2020 Remaster")
+    conn.commit()
+    return conn, a
+
+
+def test_default_scope_is_partial_only():
+    conn, a = scoped()
+    assert [i.title for i in plan_missing(conn)] == ["Cowgirl in the Sand"]
+    assert [i.title for i in plan_missing(conn, scope="partial")] == ["Cowgirl in the Sand"]
+    assert sorted(i.title for i in plan_missing(conn, scope="all")) == ["Cowgirl in the Sand", "Nobody Home"]
+    [explicit] = plan_missing(conn, release_id=conn.execute("SELECT id FROM release WHERE title LIKE 'Lonely%'").fetchone()[0])
+    assert explicit.title == "Nobody Home"  # asking for a release by id is explicit
+
+
+def test_an_existing_library_folder_of_the_release_group_is_reused():
+    conn, a = scoped()
+    [i] = plan_missing(conn)
+    assert (i.album_dir, i.release) == ("Neil Young/Decade", "Decade")
+    assert i.target_rel == "Neil Young/Decade/02 - Cowgirl in the Sand.flac"  # not "Decade (2017 Remaster)"
+    # the exact existing spelling wins, even an odd one
+    conn.execute("UPDATE file SET path = 'Neil Young/DECADE/01 - Sugar Mountain.flac'")
+    assert plan_missing(conn)[0].album_dir == "Neil Young/DECADE"
+
+
+def test_a_new_album_gets_the_cleaned_sanitised_name():
+    conn, a = scoped()
+    lonely = [i for i in plan_missing(conn, scope="all") if i.title == "Nobody Home"][0]
+    assert lonely.release == "Lonely Album: Part 1"            # tag keeps the real name
+    assert lonely.album_dir == "Neil Young/Lonely Album - Part 1"  # folder is exFAT-safe, edition marker gone
+    assert lonely.target_rel == "Neil Young/Lonely Album - Part 1/03 - Nobody Home.flac"
+
+
+def test_near_duplicate_of_an_owned_file_is_skipped_and_reported():
+    conn = ledger()
+    a = add_artist(conn)
+    hh = add_release(conn, a, "Hitchhiker", 30)
+    owned = add_recording(conn, a, "Hitchhiker", dur=277)
+    twin = add_recording(conn, a, "Hitchhiker (Like an Inca #1)", dur=277)
+    other = add_recording(conn, a, "Campaigner", dur=259)
+    add_track(conn, hh, owned, 7, "Hitchhiker", 701, dur=277)
+    add_track(conn, hh, twin, 8, "Hitchhiker (Like an Inca #1)", 702, dur=277)
+    add_track(conn, hh, other, 9, "Campaigner", 703, dur=259)
+    add_file(conn, "Neil Young/Hitchhiker/07 - Hitchhiker.flac", a, owned)
+    conn.execute("UPDATE file SET tag_title = 'Hitchhiker', duration_s = 277.387")
+    skipped = []
+    assert titles(plan_missing(conn, skipped=skipped)) == ["Campaigner"]
+    [(item, path)] = skipped
+    assert (item.title, path) == ("Hitchhiker (Like an Inca #1)", "Neil Young/Hitchhiker/07 - Hitchhiker.flac")
+    # a different duration is a different track
+    conn.execute("UPDATE track SET duration_s = 300 WHERE tidal_id = 702")
+    assert titles(plan_missing(conn)) == ["Hitchhiker (Like an Inca #1)", "Campaigner"]

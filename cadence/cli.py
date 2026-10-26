@@ -186,11 +186,16 @@ def cmd_fetch(args, conn) -> int:
     if err:
         print(f"fetch: {err}", file=sys.stderr)
         return 1
-    items = plan_missing(conn, artist_id, release_id, args.include_variants, ext_for_quality(args.quality))
+    twins: list = []
+    items = plan_missing(conn, artist_id, release_id, args.include_variants, ext_for_quality(args.quality),
+                         args.scope, twins)
     if args.limit:
         items = items[:args.limit]
+    if args.scope == "all" and release_id is None:
+        print(f"WARNING: --scope all plans {len(items)} track(s) across {len({i.album_dir for i in items})} release(s), "
+              "including whole releases you do not own at all (default scope is partial)")
     if not args.execute:
-        fetch_items(conn, None, None, items, staging, library, dry_run=True, quality=args.quality)
+        fetch_items(conn, None, None, items, staging, library, dry_run=True, quality=args.quality, skipped=twins)
         return 0
     gate = _gate(conn)
     until = gate.paused_until()
@@ -206,7 +211,7 @@ def cmd_fetch(args, conn) -> int:
     except Exception as exc:
         print(f"fetch: cannot start Tidal session: {exc}", file=sys.stderr)
         return 1
-    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality)
+    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality, skipped=twins)
     if res["stopped"] == "paused":
         print(f"gate paused until {res['until']}")
         return EXIT_PAUSED
@@ -384,6 +389,9 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--artist", metavar="NAME")
     scope.add_argument("--release", type=int, metavar="TIDAL_RELEASE_ID")
     s.add_argument("--quality", choices=QUALITIES, default=DEFAULT_QUALITY)
+    s.add_argument("--scope", choices=("partial", "all"), default="partial",
+                   help="partial (default): only releases you already own something of; all: every unowned track "
+                        "(ignored with --release)")
     s.add_argument("--staging", metavar="DIR", help="default: $CADENCE_STAGING")
     s.add_argument("--library", metavar="DIR", help="default: $CADENCE_LIBRARY")
     s.add_argument("--execute", action="store_true", help="really download and place files (network, writes)")

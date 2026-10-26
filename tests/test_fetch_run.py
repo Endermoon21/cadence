@@ -47,7 +47,7 @@ def rows(conn, table="file"):
 def run(conn, session, http, dirs, **kw):
     stg, lib = dirs
     out: list[str] = []
-    res = fetch_items(conn, session, kw.pop("gate", make_gate()), kw.pop("items", None) or plan_missing(conn), stg, lib,
+    res = fetch_items(conn, session, kw.pop("gate", make_gate()), kw.pop("items", None) or plan_missing(conn, scope="all"), stg, lib,
                       dry_run=False, quality="LOSSLESS", http=http, out=out.append, **kw)
     return res, out
 
@@ -75,7 +75,7 @@ def test_places_a_tagged_flac_and_records_the_file_row(flac, dirs):
     [ev] = rows(conn, "event_log")
     assert ev["kind"] == "fetch.placed" and ev["subject"] == f["path"]
     assert [c[1]["audioquality"] for c in session.calls] == ["LOSSLESS"] and http.urls == [URL.format(1)]
-    assert plan_missing(conn) == []  # linked now, so no longer missing
+    assert plan_missing(conn, scope="all") == []  # linked now, so no longer missing
 
 
 @needs_ffmpeg
@@ -102,7 +102,7 @@ def test_dry_run_is_the_default_and_makes_no_calls_and_no_writes(flac, dirs):
     (lib / "Neil Young/Harvest/01 - Song 1.flac").write_bytes(b"x")
     session, http, out = tidal(2), FakeHttp(default=flac), []
     before = (len(rows(conn)), len(rows(conn, "event_log")), sorted(p for p in lib.rglob("*")))
-    res = fetch_items(conn, session, make_gate(), plan_missing(conn), stg, lib, out=out.append)
+    res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all"), stg, lib, out=out.append)
     assert res["dry_run"] and (res["would_fetch"], res["exists"]) == (1, 1)
     assert session.calls == [] and http.urls == []
     assert not stg.exists()
@@ -117,7 +117,7 @@ def test_429_stops_cleanly_with_no_partial_file(flac, dirs):
     session = tidal(3, t2=TooManyRequests(120))
     http = FakeHttp({URL.format(1): flac, URL.format(3): flac})
     gate = make_gate()
-    items = plan_missing(conn)
+    items = plan_missing(conn, scope="all")
     res, _ = run(conn, session, http, dirs, gate=gate, items=items)
     stg, lib = dirs
     assert (res["placed"], res["stopped"]) == (1, "paused") and res["until"]
@@ -180,7 +180,7 @@ def test_segmented_hi_res_stream_is_remuxed_into_a_flac(flac, dirs, tmp_path):
                      **{f"https://cdn.example/seg{n}": p for n, p in enumerate(parts[1:], 1)}})
     session = FakeTidal({1: mpd_body(xml, bitDepth=16, sampleRate=44100)})
     stg, lib = dirs
-    res = fetch_items(conn, session, make_gate(), plan_missing(conn), stg, lib, dry_run=False,
+    res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all"), stg, lib, dry_run=False,
                       quality="HI_RES_LOSSLESS", http=http, out=lambda s: None)
     assert (res["placed"], res["failed"]) == (1, 0)
     [f] = rows(conn)
@@ -210,13 +210,30 @@ def cli_env(tmp_path, monkeypatch):
 
 def test_cli_without_execute_is_a_dry_run_that_never_logs_in(cli_env, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_login", lambda *a: pytest.fail("dry run must not touch Tidal"))
-    assert cli.main(["fetch", "--artist", "neil young"]) == 0
+    assert cli.main(["fetch", "--artist", "neil young", "--scope", "all"]) == 0
     out = capsys.readouterr().out
     assert "dry run" in out and out.count("would fetch") == 2
     assert not (cli_env / "staging").exists() and not list((cli_env / "lib").iterdir())
     assert cli.main(["fetch", "--release", "100", "--limit", "1"]) == 0
     assert capsys.readouterr().out.count("would fetch") == 2 - 1  # one line plus the summary mention
     assert cli.main(["fetch", "--release", "999"]) == 1
+
+
+def test_cli_default_scope_is_partial_and_all_warns(cli_env, monkeypatch, capsys):
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    c.execute("INSERT INTO release(artist_id, title, norm_title, type) SELECT 1, 'Untouched', 'untouched', 'album'")
+    rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    add_track(c, rid, add_recording(c, 1, "Lonely"), 1, "Lonely", 99)
+    add_file(c, "Neil Young/Harvest/01 - Song 1.flac", 1, 1)  # Song 1 is owned: Harvest is partial, Untouched is not
+    c.commit()
+    c.close()
+    assert cli.main(["fetch", "--artist", "neil young"]) == 0
+    out = capsys.readouterr().out
+    assert "Harvest/02 - Song 2.flac" in out and "Lonely" not in out and "WARNING" not in out
+    assert cli.main(["fetch", "--artist", "neil young", "--scope", "all"]) == 0
+    out = capsys.readouterr().out
+    assert "Lonely" in out and "WARNING: --scope all plans 2 track(s) across 2 release(s)" in out
 
 
 def test_cli_requires_paths_from_the_environment(cli_env, monkeypatch, capsys):
@@ -242,8 +259,8 @@ def test_setup_problems_stop_before_any_call(tmp_path, monkeypatch):
 @needs_ffmpeg
 def test_cli_execute_exits_3_on_429_and_persists_the_pause(cli_env, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_login", lambda gate, token: FakeTidal(default=TooManyRequests(300)))
-    assert cli.main(["fetch", "--execute", "--quality", "LOSSLESS"]) == cli.EXIT_PAUSED
+    assert cli.main(["fetch", "--execute", "--quality", "LOSSLESS", "--scope", "all"]) == cli.EXIT_PAUSED
     assert "gate paused until" in capsys.readouterr().out
     assert not list((cli_env / "lib").rglob("*.flac"))
     monkeypatch.setattr(cli, "_login", lambda *a: pytest.fail("a paused gate must not log in"))
-    assert cli.main(["fetch", "--execute"]) == cli.EXIT_PAUSED
+    assert cli.main(["fetch", "--execute", "--scope", "all"]) == cli.EXIT_PAUSED

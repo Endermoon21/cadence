@@ -258,9 +258,9 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
 
 # ---- the run ----
 
-def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out) -> dict:
+def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out, skipped) -> dict:
     res = {"dry_run": True, "would_fetch": 0, "exists": 0, "skipped_dest": 0, "placed": 0, "blocked": 0,
-           "failed": 0, "stopped": None, "until": None, "remaining": []}
+           "failed": 0, "owned_elsewhere": len(skipped), "stopped": None, "until": None, "remaining": []}
     ext = ext_for_quality(quality)
     out(f"fetch (dry run, quality {quality}): {len(items)} item(s); nothing is downloaded or written. "
         "Re-run with --execute to fetch.")
@@ -274,19 +274,22 @@ def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out
             state, key = "would fetch", "would_fetch"
         res[key] += 1
         out(f"  {state:<16} {rel}  [tidal {it.tidal_track_id}, {_fmt_dur(it.duration_s)}, dest {it.dest}]")
+    for it, owned_path in skipped:
+        out(f"  {'owned elsewhere':<16} {it.target_rel}  (owned under another title: {owned_path})")
     out(f"fetch: {res['would_fetch']} would be fetched, {res['exists']} already exist, "
-        f"{res['skipped_dest']} fiio-only skipped")
+        f"{res['skipped_dest']} fiio-only skipped, {len(skipped)} owned under another title")
     return res
 
 
 def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: list[FetchItem], staging_dir,
                 library_root, dry_run: bool = True, quality: str = DEFAULT_QUALITY, verify: bool = True, *,
-                http=None, ffmpeg: str | None = None, out=print) -> dict:
+                http=None, ffmpeg: str | None = None, out=print, skipped: list | None = None) -> dict:
     """Result keys: placed, exists, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
     setup), until, remaining (items not attempted, including the one a stop happened on)."""
     library_root = Path(library_root)
+    skipped = skipped or []  # (item, owned path) pairs the planner left out as owned under another title
     if dry_run:
-        return _dry_run(conn, items, library_root, quality, out)
+        return _dry_run(conn, items, library_root, quality, out, skipped)
     staging_dir = Path(staging_dir)
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
     res = {"dry_run": False, "placed": 0, "exists": 0, "blocked": 0, "failed": 0, "skipped_dest": 0,
@@ -342,7 +345,8 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
                 res.update(stopped="network", remaining=list(items[i + 1:]))
                 break
     out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['blocked']} blocked, "
-        f"{res['failed']} failed, {len(res['remaining'])} not attempted, stopped={res['stopped']}")
+        f"{res['failed']} failed, {len(res['remaining'])} not attempted, {len(skipped)} owned under another title, "
+        f"stopped={res['stopped']}")
     for it in res["remaining"]:
         out(f"  remaining {it.target_rel}")
     return res
