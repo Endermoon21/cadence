@@ -4,6 +4,7 @@ Writes only under `staging_dir` and `library_root` and never deletes or overwrit
 default) prints the plan and touches neither the network nor the disk. Tracks are committed one at a time."""
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import sqlite3
@@ -54,7 +55,7 @@ def _in_ledger(conn: sqlite3.Connection, rel: str) -> bool:
 
 
 def _exists(conn: sqlite3.Connection, library_root: Path, rel: str) -> bool:
-    return (library_root / rel).exists() or _in_ledger(conn, rel)
+    return os.path.lexists(library_root / rel) or _in_ledger(conn, rel)
 
 
 def _token_401(exc: BaseException) -> bool:
@@ -81,6 +82,15 @@ def _fmt_dur(s: int | None) -> str:
 def _preflight(staging_dir: Path, library_root: Path, verify: bool, ffmpeg: str | None) -> str | None:
     if not library_root.is_dir():
         return f"library {library_root} does not exist (create it first; it is never created here)"
+    lib_st = os.stat(library_root)
+    resolved = staging_dir.resolve()  # follows symlinks, even dangling ones, to where mkdir would land
+    for d in (resolved, *resolved.parents):  # same (dev, inode) catches case variants on case-insensitive volumes
+        try:
+            st = os.stat(d)
+        except OSError:
+            continue  # does not exist yet; keep walking up to the nearest existing parent
+        if (st.st_dev, st.st_ino) == (lib_st.st_dev, lib_st.st_ino):
+            return f"staging {staging_dir} is the library ({library_root}) or inside it; it must be outside"
     staging_dir.mkdir(parents=True, exist_ok=True)
     if os.stat(staging_dir).st_dev != os.stat(library_root).st_dev:
         return f"staging {staging_dir} and library {library_root} are on different filesystems; placing is a rename"
@@ -154,7 +164,8 @@ def _verify(path: Path, ffmpeg: str, expected_s: int | None) -> None:
     if audio is None:
         raise FetchError("not a readable audio file")
     if expected_s is not None and abs(audio.info.length - expected_s) > DURATION_TOLERANCE_S:
-        raise FetchError(f"duration {audio.info.length:.1f}s is not within {DURATION_TOLERANCE_S}s of Tidal's {expected_s}s")
+        raise FetchError(f"duration {audio.info.length:.1f}s is not within {DURATION_TOLERANCE_S}s of "
+                         f"Tidal's {expected_s}s")
 
 
 def _tag(path: Path, item: FetchItem) -> None:
@@ -204,14 +215,50 @@ def _insert_file(conn: sqlite3.Connection, item: FetchItem, rel: str, dest: Path
     return received or ""
 
 
+def _move_into_library(src: Path, dst: Path) -> None:
+    """Move src to dst without ever replacing an existing dst; src is left for the caller to delete after the move
+    is committed. Across filesystems (EXDEV) copy to dst's directory first so dst never appears half-written."""
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, "library file already exists", str(dst))
+    try:
+        os.rename(src, dst)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    tmp = dst.with_name(dst.name + ".part")
+    try:
+        shutil.copy2(src, tmp)
+        with open(tmp, "r+b") as fh:
+            os.fsync(fh.fileno())
+        if tmp.stat().st_size != src.stat().st_size:
+            raise FetchError(f"copy to {tmp} is {tmp.stat().st_size} bytes, the source is {src.stat().st_size}")
+        if os.path.lexists(dst):  # appeared while copying
+            raise FileExistsError(errno.EEXIST, "library file already exists", str(dst))
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _staged(staging: Path, item: FetchItem, rel: str, ext: str) -> Path:
+    """Staging path for this Tidal track: the library name plus the track id, so same-titled tracks never share one."""
+    p = Path(rel)
+    return staging / p.with_name(f"{p.stem} [tidal {item.tidal_track_id}]{ext}")
+
+
 def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, library: Path, quality: str,
-               verify: bool, ffmpeg: str | None) -> str:
-    """'placed' or 'exists'. Raises GatePaused, AuthStop, Blocked, FetchError or StreamRefused."""
+               verify: bool, ffmpeg: str | None) -> tuple[str, str]:
+    """(status, note): status is 'placed', 'exists' or 'held_lossy' (a lossy file stays in staging unless HIGH was
+    requested). Raises GatePaused, AuthStop, Blocked, FetchError or StreamRefused."""
     rel = item.target_rel
     if not _safe_rel(rel):
         raise FetchError(f"unsafe target path '{rel}'")
     if _exists(conn, library, rel):
-        return "exists"
+        return "exists", ""
+    held = _staged(staging, item, rel, ".m4a")  # where a lossy result for this track is held
+    if quality in ("LOSSLESS", "HI_RES_LOSSLESS") and os.path.lexists(held):
+        return "held_lossy", f"already held in staging, not fetched again: {held}"
     try:
         stream = gate.call(resolve_stream, session, item.tidal_track_id, quality)
     except (GatePaused, StreamRefused):
@@ -225,8 +272,8 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
     if stream.ext != Path(rel).suffix:
         rel = item.target(stream.ext)
         if _exists(conn, library, rel):
-            return "exists"
-    staged = staging / rel
+            return "exists", ""
+    staged = _staged(staging, item, rel, stream.ext)
     staged.parent.mkdir(parents=True, exist_ok=True)
     part = staged.with_name(staged.name + ".part")
     if stream.segmented:
@@ -238,11 +285,31 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
         _verify(staged, ffmpeg, item.duration_s)
     _tag(staged, item)
     facts = _file_facts(staged, stream)
+    lossy, received = quality_facts.facts(facts["codec"], facts["sample_rate"], facts["bit_depth"], facts["bitrate"])
+    # lossless-only placement: keep it in staging, no library file, no file row
+    if lossy and quality in ("LOSSLESS", "HI_RES_LOSSLESS"):
+        note = f"{staged} ({received or facts['codec']})"
+        log_event(conn, "fetch.held_lossy", rel, f"Held '{item.title}' by {item.artist} in staging: got lossy "
+                  f"{received or facts['codec']} but {quality} was requested", {
+                      "tidal_track_id": item.tidal_track_id, "recording_id": item.recording_id, "path": rel,
+                      "staged": str(staged), "quality_requested": quality, "quality_received": received,
+                      "audio_quality": stream.audio_quality})
+        conn.commit()
+        return "held_lossy", note
     dest = library / rel
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        return "exists"
-    os.rename(staged, dest)
+    if os.path.lexists(dest):
+        return "exists", ""
+    new_dirs = [d for d in (dest.parent, *dest.parent.parents) if not os.path.lexists(d)]  # deepest first
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _move_into_library(staged, dest)
+    except BaseException:
+        for d in new_dirs:  # only directories this call created, and only while empty
+            try:
+                d.rmdir()
+            except OSError:
+                break
+        raise
     try:
         received = _insert_file(conn, item, rel, dest, facts, quality)
         log_event(conn, "fetch.placed", rel, f"Placed '{item.title}' by {item.artist} as {received or facts['codec']}",
@@ -253,14 +320,31 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
     except sqlite3.Error as exc:
         conn.rollback()
         raise FetchError(f"placed {rel} but the ledger insert failed ({exc}); import-legacy will pick it up") from exc
-    return "placed"
+    try:  # only after the commit; the helper never deletes the source
+        staged.unlink(missing_ok=True)  # already gone after a same-filesystem rename
+    except OSError as exc:
+        log_event(conn, "fetch.staged_cleanup_failed", rel, f"Placed '{item.title}' by {item.artist} and recorded it, "
+                  f"but could not remove the staged copy {staged} ({_safe_message(exc)}); remove it by hand",
+                  {"path": rel, "staged": str(staged)})
+        conn.commit()
+    held = _staged(staging, item, rel, ".m4a")  # only this exact staged sibling, never a library file
+    if os.path.lexists(held):
+        try:
+            held.unlink()
+            log_event(conn, "fetch.stale_held_removed", rel, f"Removed the lossy staged copy of '{item.title}' by "
+                      f"{item.artist} because a FLAC was placed", {"path": rel, "staged": str(held)})
+        except Exception as exc:  # the placement stands either way
+            log_event(conn, "fetch.stale_held_remove_failed", rel, f"Could not remove the lossy staged copy {held}: "
+                      f"{_safe_message(exc)}", {"path": rel, "staged": str(held)})
+        conn.commit()
+    return "placed", ""
 
 
 # ---- the run ----
 
 def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out, skipped) -> dict:
-    res = {"dry_run": True, "would_fetch": 0, "exists": 0, "skipped_dest": 0, "placed": 0, "blocked": 0,
-           "failed": 0, "owned_elsewhere": len(skipped), "stopped": None, "until": None, "remaining": []}
+    res = {"dry_run": True, "would_fetch": 0, "exists": 0, "skipped_dest": 0, "placed": 0, "held_lossy": 0,
+           "blocked": 0, "failed": 0, "owned_elsewhere": len(skipped), "stopped": None, "until": None, "remaining": []}
     ext = ext_for_quality(quality)
     out(f"fetch (dry run, quality {quality}): {len(items)} item(s); nothing is downloaded or written. "
         "Re-run with --execute to fetch.")
@@ -284,7 +368,7 @@ def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out
 def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: list[FetchItem], staging_dir,
                 library_root, dry_run: bool = True, quality: str = DEFAULT_QUALITY, verify: bool = True, *,
                 http=None, ffmpeg: str | None = None, out=print, skipped: list | None = None) -> dict:
-    """Result keys: placed, exists, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
+    """Result keys: placed, exists, held_lossy, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
     setup), until, remaining (items not attempted, including the one a stop happened on)."""
     library_root = Path(library_root)
     skipped = skipped or []  # (item, owned path) pairs the planner left out as owned under another title
@@ -292,8 +376,8 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
         return _dry_run(conn, items, library_root, quality, out, skipped)
     staging_dir = Path(staging_dir)
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
-    res = {"dry_run": False, "placed": 0, "exists": 0, "blocked": 0, "failed": 0, "skipped_dest": 0,
-           "stopped": None, "until": None, "remaining": []}
+    res = {"dry_run": False, "placed": 0, "exists": 0, "held_lossy": 0, "blocked": 0, "failed": 0,
+           "skipped_dest": 0, "stopped": None, "until": None, "remaining": []}
     problem = _preflight(staging_dir, library_root, verify, ffmpeg)
     if problem:
         out(f"fetch: {problem}")
@@ -306,9 +390,9 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
             out(f"  skip (fiio-only, not handled yet) {it.target_rel}")
             continue
         try:
-            status = _fetch_one(conn, session, gate, http, it, staging_dir, library_root, quality, verify, ffmpeg)
+            status, note = _fetch_one(conn, session, gate, http, it, staging_dir, library_root, quality, verify, ffmpeg)
             res[status] += 1
-            out(f"  {status:<8} {it.target_rel}")
+            out(f"  {status:<10} {it.target_rel}" + (f"  ({note})" if note else ""))
             network_failures = 0
         except GatePaused as p:
             conn.rollback()
@@ -330,7 +414,7 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
                       f"Tidal refused playback (401) for '{it.title}' by {it.artist}: {exc}",
                       {"tidal_track_id": it.tidal_track_id, "path": it.target_rel})
             conn.commit()
-            out(f"  blocked  {it.target_rel}")
+            out(f"  blocked    {it.target_rel}")
             network_failures = 0
         except Exception as exc:
             conn.rollback()
@@ -339,12 +423,13 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
             log_event(conn, "fetch.failed", str(it.tidal_track_id), f"'{it.title}' by {it.artist}: {msg}",
                       {"tidal_track_id": it.tidal_track_id, "path": it.target_rel})
             conn.commit()
-            out(f"  failed   {it.target_rel}  ({msg})")
+            out(f"  failed     {it.target_rel}  ({msg})")
             network_failures = network_failures + 1 if _is_dead_connection(exc) else 0
             if network_failures >= MAX_NETWORK_FAILURES:
                 res.update(stopped="network", remaining=list(items[i + 1:]))
                 break
-    out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['blocked']} blocked, "
+    out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['held_lossy']} held (lossy), "
+        f"{res['blocked']} blocked, "
         f"{res['failed']} failed, {len(res['remaining'])} not attempted, {len(skipped)} owned under another title, "
         f"stopped={res['stopped']}")
     for it in res["remaining"]:

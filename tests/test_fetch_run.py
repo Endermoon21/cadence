@@ -1,21 +1,32 @@
+import errno
+import os
+
 import mutagen
 import pytest
 
 from cadence import cli
+from cadence.fetch import run as fetch_run
 from cadence.fetch.plan import plan_missing
-from cadence.fetch.run import fetch_items
+from cadence.fetch.run import DEFAULT_QUALITY, fetch_items
 from tests.fakes import TooManyRequests, make_gate
 from tests.fetch_fakes import (FFMPEG, FakeHttp, FakeTidal, add_artist, add_file, add_recording, add_release,
-                               add_track, bts_body, http_error, ledger, make_flac, mpd_body, split_fmp4)
+                               add_track, bts_body, http_error, ledger, make_aac, make_flac, mpd_body,
+                               split_fmp4)
 
 needs_ffmpeg = pytest.mark.skipif(not FFMPEG, reason="ffmpeg not installed: decode check and FLAC fixture unavailable")
 URL = "https://cdn.example/{}.flac"
+STAGED1 = "Neil Young/Harvest/01 - Song 1 [tidal 1]"  # staging name of track 1 (add .flac / .m4a)
 ISRC = "USRE17200001"
 
 
 @pytest.fixture(scope="module")
 def flac(tmp_path_factory):
     return make_flac(tmp_path_factory.mktemp("fx") / "t.flac")
+
+
+@pytest.fixture(scope="module")
+def aac(tmp_path_factory):
+    return make_aac(tmp_path_factory.mktemp("fx") / "t.m4a")
 
 
 @pytest.fixture
@@ -48,7 +59,8 @@ def run(conn, session, http, dirs, **kw):
     stg, lib = dirs
     out: list[str] = []
     res = fetch_items(conn, session, kw.pop("gate", make_gate()), kw.pop("items", None) or plan_missing(conn, scope="all"), stg, lib,
-                      dry_run=False, quality="LOSSLESS", http=http, out=out.append, **kw)
+                      dry_run=False, quality=kw.pop("quality", "LOSSLESS"), http=http,
+                      out=out.append, **kw)
     return res, out
 
 
@@ -69,6 +81,7 @@ def test_places_a_tagged_flac_and_records_the_file_row(flac, dirs):
         ("Neil Young/Harvest/01 - Song 1.flac", "tidal", "manual", 1.0, a)
     assert f["recording_id"] == conn.execute("SELECT id FROM recording WHERE title = 'Song 1'").fetchone()[0]
     assert (f["codec"], f["sample_rate"], f["bit_depth"], f["lossy"]) == ("flac", 44100, 16, 0)
+    assert res["held_lossy"] == 0
     assert (f["quality_requested"], f["quality_received"]) == ("LOSSLESS", "FLAC 16/44.1")
     assert (f["size"], f["mtime"]) == (dest.stat().st_size, int(dest.stat().st_mtime))
     assert abs(f["duration_s"] - 4) < 0.1
@@ -76,6 +89,286 @@ def test_places_a_tagged_flac_and_records_the_file_row(flac, dirs):
     assert ev["kind"] == "fetch.placed" and ev["subject"] == f["path"]
     assert [c[1]["audioquality"] for c in session.calls] == ["LOSSLESS"] and http.urls == [URL.format(1)]
     assert plan_missing(conn, scope="all") == []  # linked now, so no longer missing
+
+
+def cross_device(monkeypatch, lib, seen):
+    """Make only the rename into the library fail with EXDEV; record the staged bytes it was about to move."""
+    real = os.rename
+
+    def rename(src, dst, *a, **kw):
+        if os.fspath(dst).startswith(os.fspath(lib)):
+            seen.append(open(src, "rb").read())
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real(src, dst, *a, **kw)
+    monkeypatch.setattr(fetch_run.os, "rename", rename)
+
+
+@needs_ffmpeg
+def test_cross_device_placement_copies_then_replaces_and_leaves_no_part_file(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    seen: list[bytes] = []
+    cross_device(monkeypatch, lib, seen)
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    dest = lib / "Neil Young/Harvest/01 - Song 1.flac"
+    assert (res["placed"], res["failed"]) == (1, 0) and len(seen) == 1
+    assert dest.read_bytes() == seen[0]
+    assert [f["path"] for f in rows(conn)] == ["Neil Young/Harvest/01 - Song 1.flac"]
+    assert not any(p.is_file() for p in stg.rglob("*"))  # staged source is gone
+    assert not list(lib.rglob("*.part"))
+
+
+@needs_ffmpeg
+def test_cross_device_copy_failure_fails_the_track_and_leaves_nothing_half_placed(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    cross_device(monkeypatch, lib, [])
+
+    def broken_copy(src, dst, *a, **kw):
+        open(dst, "wb").write(b"half")  # a partial copy that must be cleaned up
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(fetch_run.shutil, "copy2", broken_copy)
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (0, 1)
+    assert not any(p.is_file() for p in lib.rglob("*"))  # no library file, no .part
+    assert (stg / f"{STAGED1}.flac").is_file()  # source untouched
+    assert rows(conn) == []
+
+
+AAC_URL = "https://cdn.example/{}.mp4"
+
+
+def aac_tidal():
+    return FakeTidal({1: bts_body(url=AAC_URL.format(1), codec="mp4a.40.2", audioQuality="HIGH", bitDepth=None)})
+
+
+@needs_ffmpeg
+def test_lossy_result_under_a_lossless_request_is_held_in_staging(aac, dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    res, out = run(conn, aac_tidal(), FakeHttp({AAC_URL.format(1): aac}), dirs)
+    staged = stg / f"{STAGED1}.m4a"
+    assert (res["held_lossy"], res["placed"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert staged.is_file() and not any(p.is_file() for p in lib.rglob("*")) and rows(conn) == []
+    assert list(lib.iterdir()) == []  # no library directory was created either
+    assert list(stg.rglob("*.part")) == []
+    [ev] = rows(conn, "event_log")
+    assert ev["kind"] == "fetch.held_lossy" and ev["subject"] == "Neil Young/Harvest/01 - Song 1.m4a"
+    text = "\n".join(out)
+    assert "held_lossy" in text and str(staged) in text and "AAC" in text and "1 held (lossy)" in text
+
+
+@needs_ffmpeg
+def test_lossy_result_under_the_default_quality_is_held_not_placed(aac, dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    res, _ = run(conn, aac_tidal(), FakeHttp({AAC_URL.format(1): aac}), dirs, quality=DEFAULT_QUALITY)
+    assert DEFAULT_QUALITY == "HI_RES_LOSSLESS"
+    assert (res["held_lossy"], res["placed"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert (stg / f"{STAGED1}.m4a").is_file() and list(lib.iterdir()) == [] and rows(conn) == []
+    assert list(stg.rglob("*.part")) == []
+    [ev] = rows(conn, "event_log")
+    assert ev["kind"] == "fetch.held_lossy"
+
+
+@needs_ffmpeg
+def test_lossy_result_under_a_high_request_is_placed_as_before(aac, dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    res, _ = run(conn, aac_tidal(), FakeHttp({AAC_URL.format(1): aac}), dirs, quality="HIGH")
+    dest = lib / "Neil Young/Harvest/01 - Song 1.m4a"
+    assert (res["placed"], res["held_lossy"], res["failed"]) == (1, 0, 0)
+    assert dest.is_file() and not any(p.is_file() for p in stg.rglob("*"))
+    [f] = rows(conn)
+    assert (f["path"], f["codec"], f["lossy"], f["quality_requested"]) == \
+        ("Neil Young/Harvest/01 - Song 1.m4a", "aac", 1, "HIGH")
+    assert f["quality_received"].startswith("AAC")
+
+
+def test_an_already_held_lossy_file_is_not_fetched_again(dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    held = stg / f"{STAGED1}.m4a"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(b"held")
+    session, http, gate = tidal(1), FakeHttp(), make_gate()
+    res, out = run(conn, session, http, dirs, gate=gate)
+    assert (res["held_lossy"], res["placed"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert session.calls == [] and http.urls == [] and held.read_bytes() == b"held"
+    assert rows(conn) == [] and rows(conn, "event_log") == [] and list(lib.iterdir()) == []
+    assert "held_lossy" in "\n".join(out) and str(held) in "\n".join(out)
+
+
+@needs_ffmpeg
+def test_placing_a_flac_removes_the_held_lossy_sibling(flac, dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    held = stg / f"{STAGED1}.m4a"
+    other = stg / "Neil Young/Harvest/02 - Song 2.m4a"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"other")
+
+    class HeldAppearsMidRun(FakeHttp):  # a held file already there would skip the track, so it shows up after the check
+        def get(self, url, stream=False, timeout=None):
+            held.write_bytes(b"held")
+            return super().get(url, stream, timeout)
+
+    res, _ = run(conn, tidal(1), HeldAppearsMidRun({URL.format(1): flac}), dirs)
+    dest = lib / "Neil Young/Harvest/01 - Song 1.flac"
+    assert (res["placed"], res["held_lossy"], res["failed"]) == (1, 0, 0)
+    assert dest.is_file() and not held.exists() and other.read_bytes() == b"other"
+    [f] = rows(conn)
+    assert f["path"] == "Neil Young/Harvest/01 - Song 1.flac"
+    assert [e["kind"] for e in rows(conn, "event_log")] == ["fetch.placed", "fetch.stale_held_removed"]
+    ev = rows(conn, "event_log")[1]
+    assert ev["subject"] == f["path"] and "FLAC was placed" in ev["message"]
+
+
+@needs_ffmpeg
+def test_a_held_lossy_file_does_not_stop_a_high_request_from_fetching_and_placing(aac, dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    held = stg / f"{STAGED1}.m4a"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(b"held")
+    session = aac_tidal()
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs, quality="HIGH")
+    assert (res["placed"], res["held_lossy"], res["failed"]) == (1, 0, 0) and len(session.calls) == 1
+    assert (lib / "Neil Young/Harvest/01 - Song 1.m4a").is_file() and not any(p.is_file() for p in stg.rglob("*"))
+
+
+@needs_ffmpeg
+def test_a_held_track_does_not_skip_or_overwrite_the_same_titled_track_on_another_disc(flac, dirs):
+    conn = ledger()
+    a = add_artist(conn)
+    rel = add_release(conn, a, "Harvest", 100)
+    for disc, tid in ((1, 1), (2, 2)):  # same number and title: the same library name, two different Tidal tracks
+        add_track(conn, rel, add_recording(conn, a, "Song", isrc=f"{ISRC[:-1]}{tid}"), 1, "Song", tid, disc=disc)
+    conn.commit()
+    items = plan_missing(conn, scope="all")
+    assert [i.target_rel for i in items] == ["Neil Young/Harvest/01 - Song.flac"] * 2
+    stg, lib = dirs
+    held = stg / "Neil Young/Harvest/01 - Song [tidal 1].m4a"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(b"held")
+    session = tidal(2)
+    res, _ = run(conn, session, FakeHttp({URL.format(2): flac}), dirs, items=items)
+    assert (res["held_lossy"], res["placed"], res["failed"]) == (1, 1, 0)
+    assert [c[0].split("/")[1] for c in session.calls] == ["2"]  # only track 2 was asked for
+    assert held.read_bytes() == b"held"
+    assert (lib / "Neil Young/Harvest/01 - Song.flac").is_file()
+    assert [p for p in stg.rglob("*") if p.is_file()] == [held]
+
+
+@needs_ffmpeg
+def test_cross_device_copy_with_a_size_mismatch_fails_the_track_and_keeps_the_source(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    cross_device(monkeypatch, lib, [])
+    real = fetch_run.shutil.copy2
+
+    def short_copy(src, dst, *a, **kw):
+        real(src, dst, *a, **kw)
+        os.truncate(dst, 10)  # the copy "succeeded" but is short
+    monkeypatch.setattr(fetch_run.shutil, "copy2", short_copy)
+    res, out = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (0, 1) and "10 bytes" in "\n".join(out)
+    assert not any(p.is_file() for p in lib.rglob("*")) and list(lib.iterdir()) == []  # no .part, no empty album dir
+    assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
+
+
+@needs_ffmpeg
+def test_a_staged_copy_that_cannot_be_removed_after_commit_still_reports_placed(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    cross_device(monkeypatch, lib, [])
+    real = fetch_run.Path.unlink
+
+    def unlink(self, *a, **kw):
+        if "[tidal" in self.name:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real(self, *a, **kw)
+    monkeypatch.setattr(fetch_run.Path, "unlink", unlink)
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (1, 0)
+    assert (lib / "Neil Young/Harvest/01 - Song 1.flac").is_file() and (stg / f"{STAGED1}.flac").is_file()
+    assert [f["path"] for f in rows(conn)] == ["Neil Young/Harvest/01 - Song 1.flac"]
+    placed, failed = rows(conn, "event_log")
+    assert (placed["kind"], failed["kind"]) == ("fetch.placed", "fetch.staged_cleanup_failed")
+    assert failed["subject"] == "Neil Young/Harvest/01 - Song 1.flac" and "by hand" in failed["message"]
+
+
+@needs_ffmpeg
+def test_a_library_file_that_appears_during_the_cross_device_copy_is_not_replaced(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    cross_device(monkeypatch, lib, [])
+    real = fetch_run.shutil.copy2
+    dest = lib / "Neil Young/Harvest/01 - Song 1.flac"
+
+    def copy_then_race(src, dst, *a, **kw):
+        real(src, dst, *a, **kw)
+        dest.write_bytes(b"precious")  # someone else puts the file there while we copy
+    monkeypatch.setattr(fetch_run.shutil, "copy2", copy_then_race)
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (0, 1)
+    assert dest.read_bytes() == b"precious" and not list(lib.rglob("*.part"))
+    assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
+
+
+def test_move_into_library_refuses_an_existing_destination_and_keeps_both_files(tmp_path):
+    src, dst = tmp_path / "src.flac", tmp_path / "dst.flac"
+    src.write_bytes(b"new")
+    dst.write_bytes(b"precious")
+    with pytest.raises(FileExistsError):
+        fetch_run._move_into_library(src, dst)
+    assert (src.read_bytes(), dst.read_bytes()) == (b"new", b"precious")
+
+
+def test_staging_inside_or_equal_to_the_library_is_refused_before_any_call(tmp_path):
+    conn, a = seed(1)
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (tmp_path / "link").symlink_to(lib / "stg")
+    for stg in (lib / "staging", lib, tmp_path / "link"):
+        session, http = tidal(1), FakeHttp()
+        res, out = run(conn, session, http, (stg, lib))
+        assert res["stopped"] == "setup" and len(res["remaining"]) == 1 and "inside it" in out[0]
+        assert session.calls == [] and http.urls == [] and list(lib.iterdir()) == []
+
+
+def test_staging_with_a_different_letter_case_than_the_library_is_refused(tmp_path):
+    conn, a = seed(1)
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    if not (tmp_path / "LIB").exists():
+        pytest.skip("case-sensitive filesystem: a case-variant path cannot name the library here")
+    session, http = tidal(1), FakeHttp()
+    res, out = run(conn, session, http, (tmp_path / "LIB" / "staging", lib))
+    assert res["stopped"] == "setup" and "inside it" in out[0]
+    assert session.calls == [] and http.urls == [] and list(lib.iterdir()) == []
+
+
+def test_a_dangling_symlink_at_the_destination_counts_as_existing_and_is_not_replaced(dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    target = lib / "Neil Young/Harvest/01 - Song 1.flac"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(lib / "nowhere.flac")  # dangling
+    session, http = tidal(1), FakeHttp()
+    res, out = run(conn, session, http, dirs)
+    assert (res["placed"], res["exists"]) == (0, 1)
+    assert target.is_symlink() and not target.exists() and os.readlink(target) == str(lib / "nowhere.flac")
+    assert session.calls == [] and http.urls == [] and rows(conn) == []
+
+
+def test_move_into_library_refuses_a_dangling_symlink_destination(tmp_path):
+    src, dst = tmp_path / "src.flac", tmp_path / "dst.flac"
+    src.write_bytes(b"new")
+    dst.symlink_to(tmp_path / "nowhere.flac")
+    with pytest.raises(FileExistsError):
+        fetch_run._move_into_library(src, dst)
+    assert src.read_bytes() == b"new" and dst.is_symlink() and not dst.exists()
 
 
 @needs_ffmpeg

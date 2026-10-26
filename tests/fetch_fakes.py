@@ -21,12 +21,14 @@ def ledger():
 
 
 def add_artist(conn, name="Neil Young", tidal_id=1, match="auto", dest="server") -> int:
-    return conn.execute("INSERT INTO artist(name, norm_name, tidal_id, tidal_match, default_dest) VALUES (?, ?, ?, ?, ?)",
+    return conn.execute("INSERT INTO artist(name, norm_name, tidal_id, tidal_match, default_dest) "
+                        "VALUES (?, ?, ?, ?, ?)",
                         (name, name.lower(), tidal_id, match, dest)).lastrowid
 
 
 def add_release(conn, artist_id, title, tidal_ref, type="album", date="2000-01-01", role="own") -> int:
-    rid = conn.execute("INSERT INTO release(artist_id, title, norm_title, type, role, release_date) VALUES (?, ?, ?, ?, ?, ?)",
+    rid = conn.execute("INSERT INTO release(artist_id, title, norm_title, type, role, release_date) "
+                       "VALUES (?, ?, ?, ?, ?, ?)",
                        (artist_id, title, title.lower(), type, role, date)).lastrowid
     conn.execute("INSERT INTO release_source(release_id, provider, provider_ref) VALUES (?, 'tidal', ?)",
                  (rid, str(tidal_ref)))
@@ -40,9 +42,9 @@ def add_recording(conn, artist_id, title, isrc=None, variant=None, canon_id=None
 
 
 def add_track(conn, release_id, recording_id, number, title, tidal_id, dur=4, disc=1, version=None) -> int:
-    return conn.execute("INSERT INTO track(release_id, recording_id, tidal_id, disc, number, title, version, duration_s) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (release_id, recording_id, tidal_id, disc, number, title,
-                                                            version, dur)).lastrowid
+    return conn.execute("INSERT INTO track(release_id, recording_id, tidal_id, disc, number, title, version, "
+                        "duration_s) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (release_id, recording_id, tidal_id, disc, number, title, version, dur)).lastrowid
 
 
 def add_file(conn, path, artist_id, recording_id=None) -> None:
@@ -125,9 +127,18 @@ class FakeHttp:
 
 
 def make_flac(path, seconds: int = 4) -> bytes:
-    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}:sample_rate=44100",
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"sine=frequency=440:duration={seconds}:sample_rate=44100",
                     "-c:a", "flac", "-sample_fmt", "s16", "-map_metadata", "-1", "-fflags", "+bitexact",
                     "-flags:a", "+bitexact", str(path)], check=True)
+    return path.read_bytes()
+
+
+def make_aac(path, seconds: int = 4) -> bytes:
+    """A lossy AAC-in-m4a stand-in for a HIGH stream (or a lossless request that came back lossy)."""
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"sine=frequency=440:duration={seconds}:sample_rate=44100",
+                    "-c:a", "aac", "-b:a", "128k", "-map_metadata", "-1", str(path)], check=True)
     return path.read_bytes()
 
 
