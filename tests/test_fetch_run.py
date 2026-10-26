@@ -17,6 +17,7 @@ needs_ffmpeg = pytest.mark.skipif(not FFMPEG, reason="ffmpeg not installed: deco
 URL = "https://cdn.example/{}.flac"
 STAGED1 = "Neil Young/Harvest/01 - Song 1 [tidal 1]"  # staging name of track 1 (add .flac / .m4a)
 ISRC = "USRE17200001"
+PROBE = ".cadence-linkprobe-"  # the preflight's own hard-link probe in the library root; the link hooks let it through
 
 
 @pytest.fixture(scope="module")
@@ -92,19 +93,21 @@ def test_places_a_tagged_flac_and_records_the_file_row(flac, dirs):
 
 
 def cross_device(monkeypatch, lib, seen):
-    """Make only the rename into the library fail with EXDEV; record the staged bytes it was about to move."""
-    real = os.rename
+    """Make only the link of the staged file into the library fail with EXDEV (the .part link, which is within the
+    library, still works); record the staged bytes it was about to place."""
+    real = os.link
 
-    def rename(src, dst, *a, **kw):
-        if os.fspath(dst).startswith(os.fspath(lib)):
+    def link(src, dst, *a, **kw):
+        if (os.fspath(dst).startswith(os.fspath(lib)) and not os.fspath(src).endswith(".part")
+                and PROBE not in os.fspath(dst)):
             seen.append(open(src, "rb").read())
             raise OSError(errno.EXDEV, "Invalid cross-device link")
         return real(src, dst, *a, **kw)
-    monkeypatch.setattr(fetch_run.os, "rename", rename)
+    monkeypatch.setattr(fetch_run.os, "link", link)
 
 
 @needs_ffmpeg
-def test_cross_device_placement_copies_then_replaces_and_leaves_no_part_file(flac, dirs, monkeypatch):
+def test_cross_device_placement_copies_then_links_and_leaves_no_part_file(flac, dirs, monkeypatch):
     conn, a = seed(1)
     stg, lib = dirs
     seen: list[bytes] = []
@@ -242,13 +245,13 @@ def test_a_held_track_does_not_skip_or_overwrite_the_same_titled_track_on_anothe
     conn = ledger()
     a = add_artist(conn)
     rel = add_release(conn, a, "Harvest", 100)
-    for disc, tid in ((1, 1), (2, 2)):  # same number and title: the same library name, two different Tidal tracks
+    for disc, tid in ((1, 1), (2, 2)):  # same number and title, two different Tidal tracks, told apart by the disc
         add_track(conn, rel, add_recording(conn, a, "Song", isrc=f"{ISRC[:-1]}{tid}"), 1, "Song", tid, disc=disc)
     conn.commit()
     items = plan_missing(conn, scope="all")
-    assert [i.target_rel for i in items] == ["Neil Young/Harvest/01 - Song.flac"] * 2
+    assert [i.target_rel for i in items] == ["Neil Young/Harvest/D1-01 - Song.flac", "Neil Young/Harvest/D2-01 - Song.flac"]
     stg, lib = dirs
-    held = stg / "Neil Young/Harvest/01 - Song [tidal 1].m4a"
+    held = stg / "Neil Young/Harvest/D1-01 - Song [tidal 1].m4a"
     held.parent.mkdir(parents=True)
     held.write_bytes(b"held")
     session = tidal(2)
@@ -256,8 +259,28 @@ def test_a_held_track_does_not_skip_or_overwrite_the_same_titled_track_on_anothe
     assert (res["held_lossy"], res["placed"], res["failed"]) == (1, 1, 0)
     assert [c[0].split("/")[1] for c in session.calls] == ["2"]  # only track 2 was asked for
     assert held.read_bytes() == b"held"
-    assert (lib / "Neil Young/Harvest/01 - Song.flac").is_file()
+    assert (lib / "Neil Young/Harvest/D2-01 - Song.flac").is_file()
     assert [p for p in stg.rglob("*") if p.is_file()] == [held]
+
+
+@needs_ffmpeg
+def test_two_discs_with_the_same_track_and_title_are_both_fetched_under_distinct_names(flac, dirs):
+    conn = ledger()
+    a = add_artist(conn)
+    rel = add_release(conn, a, "Harvest", 100)
+    for disc, tid in ((1, 1), (2, 2)):
+        add_track(conn, rel, add_recording(conn, a, "Intro", isrc=f"{ISRC[:-1]}{tid}"), 1, "Intro", tid, disc=disc)
+    conn.commit()
+    stg, lib = dirs
+    res, _ = run(conn, tidal(2), FakeHttp({URL.format(1): flac, URL.format(2): flac}), dirs)
+    assert (res["placed"], res["exists"], res["failed"]) == (2, 0, 0)
+    assert sorted(str(p.relative_to(lib)) for p in lib.rglob("*.flac")) == \
+        ["Neil Young/Harvest/D1-01 - Intro.flac", "Neil Young/Harvest/D2-01 - Intro.flac"]
+    files = rows(conn)
+    assert sorted((f["path"], f["tag_disc"]) for f in files) == \
+        [("Neil Young/Harvest/D1-01 - Intro.flac", "1"), ("Neil Young/Harvest/D2-01 - Intro.flac", "2")]
+    assert len({f["recording_id"] for f in files}) == 2
+    assert plan_missing(conn, scope="all") == []
 
 
 @needs_ffmpeg
@@ -313,6 +336,62 @@ def test_a_library_file_that_appears_during_the_cross_device_copy_is_not_replace
     res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
     assert (res["placed"], res["failed"]) == (0, 1)
     assert dest.read_bytes() == b"precious" and not list(lib.rglob("*.part"))
+    assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
+
+
+def link_hook(monkeypatch, lib, before=None, error=None, seen=None):
+    """Wrap os.link for destinations in the library: record the source bytes, run before(dst), maybe raise error."""
+    real = os.link
+
+    def link(src, dst, *a, **kw):
+        if os.fspath(dst).startswith(os.fspath(lib)) and PROBE not in os.fspath(dst):
+            if seen is not None:
+                seen.append(open(src, "rb").read())
+            if before:
+                before(dst)
+            if error:
+                raise error
+        return real(src, dst, *a, **kw)
+    monkeypatch.setattr(fetch_run.os, "link", link)
+
+
+@needs_ffmpeg
+def test_a_library_file_that_appears_just_before_the_link_is_not_replaced(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    dest = lib / "Neil Young/Harvest/01 - Song 1.flac"
+    link_hook(monkeypatch, lib, before=lambda dst: dest.write_bytes(b"precious"))  # lands after every lexists check
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (0, 1)
+    assert dest.read_bytes() == b"precious" and not list(lib.rglob("*.part"))
+    assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
+
+
+@needs_ffmpeg
+def test_same_filesystem_placement_links_the_staged_bytes_and_leaves_no_source(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    seen: list[bytes] = []
+    link_hook(monkeypatch, lib, seen=seen)
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    dest = lib / "Neil Young/Harvest/01 - Song 1.flac"
+    assert (res["placed"], res["failed"]) == (1, 0) and len(seen) == 1
+    assert dest.read_bytes() == seen[0] and dest.stat().st_nlink == 1
+    assert [f["path"] for f in rows(conn)] == ["Neil Young/Harvest/01 - Song 1.flac"]
+    assert not any(p.is_file() for p in stg.rglob("*")) and not list(lib.rglob("*.part"))
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("cross", [False, True])
+def test_hard_links_unsupported_fails_the_track_without_an_overwriting_fallback(flac, dirs, monkeypatch, cross):
+    conn, a = seed(1)
+    stg, lib = dirs
+    link_hook(monkeypatch, lib, error=OSError(errno.EPERM, "Operation not permitted"))
+    if cross:
+        cross_device(monkeypatch, lib, [])  # staged link is EXDEV, so a .part is copied, then its link is refused
+    res, out = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (0, 1) and "hard links" in "\n".join(out)
+    assert not any(p.is_file() for p in lib.rglob("*")) and list(lib.iterdir()) == []  # no file, no .part, no dirs
     assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
 
 
@@ -547,6 +626,20 @@ def test_setup_problems_stop_before_any_call(tmp_path, monkeypatch):
     res, out = run(conn, session, http, (stg, lib))
     assert res["stopped"] == "setup" and "ffmpeg not found" in out[0]
     assert session.calls == [] and http.urls == []
+
+
+def test_a_library_mount_without_hard_links_stops_at_setup_before_any_tidal_call(dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    session, http = tidal(1), FakeHttp()
+
+    def no_link(src, dst, *a, **kw):
+        raise OSError(errno.EPERM, "Operation not permitted")
+    monkeypatch.setattr(fetch_run.os, "link", no_link)
+    monkeypatch.setattr("cadence.fetch.run.shutil.which", lambda name: "/usr/bin/ffmpeg")
+    res, out = run(conn, session, http, dirs)
+    assert res["stopped"] == "setup" and len(res["remaining"]) == 1 and "hard links are required" in out[0]
+    assert session.calls == [] and http.urls == [] and list(lib.iterdir()) == []  # the probe files are gone
 
 
 @needs_ffmpeg

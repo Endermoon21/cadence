@@ -61,7 +61,7 @@ def test_item_fields_and_unusable_tracks():
     [i] = plan_missing(conn, scope="all")
     assert (i.artist, i.release, i.disc, i.number, i.title, i.tidal_track_id, i.duration_s, i.isrc, i.dest) == \
         ("Neil Young", "Harvest", 2, 4, "Old Man (Live)", 7, 203, "USRE17200012", "server")
-    assert i.target_rel == "Neil Young/Harvest/04 - Old Man (Live).flac"
+    assert i.target_rel == "Neil Young/Harvest/D2-04 - Old Man (Live).flac"  # the release has discs 1 and 2
 
 
 def test_artists_without_a_resolved_tidal_match_are_skipped():
@@ -169,3 +169,37 @@ def test_near_duplicate_of_an_owned_file_is_skipped_and_reported():
     # a different duration is a different track
     conn.execute("UPDATE track SET duration_s = 300 WHERE tidal_id = 702")
     assert titles(plan_missing(conn)) == ["Hitchhiker (Like an Inca #1)", "Campaigner"]
+
+
+# ---- discs ----
+
+def two_discs():
+    conn, a, rel = seed()
+    r1, r2 = (add_recording(conn, a, "Intro") for _ in range(2))
+    add_track(conn, rel, r1, 1, "Intro", 1, disc=1)
+    add_track(conn, rel, r2, 1, "Intro", 2, disc=2)
+    return conn, a, rel, r1, r2
+
+
+def test_same_numbered_same_titled_tracks_on_two_discs_get_distinct_targets():
+    conn, *_ = two_discs()
+    items = plan_missing(conn, scope="all")
+    assert [(i.disc, i.target_rel) for i in items] == [(1, "Neil Young/Harvest/D1-01 - Intro.flac"),
+                                                       (2, "Neil Young/Harvest/D2-01 - Intro.flac")]
+    assert plan_missing(conn, ext=".m4a", scope="all")[1].target_rel == "Neil Young/Harvest/D2-01 - Intro.m4a"
+
+
+def test_single_disc_names_are_unchanged():
+    conn, a, rel = seed()
+    for n in (1, 2):
+        add_track(conn, rel, add_recording(conn, a, f"Song {n}"), n, f"Song {n}", n)
+    assert [i.target_rel for i in plan_missing(conn, scope="all")] == ["Neil Young/Harvest/01 - Song 1.flac",
+                                                                       "Neil Young/Harvest/02 - Song 2.flac"]
+
+
+def test_disc_count_covers_tracks_that_are_not_fetchable_or_not_missing():
+    conn, a, rel, r1, r2 = two_discs()
+    add_file(conn, "Neil Young/Harvest/01 - Intro.flac", a, r1)  # disc 1 is owned under the old single-disc name
+    conn.execute("UPDATE track SET tidal_id = NULL WHERE disc = 1")
+    # the owned cluster is not planned, so the old name is never claimed again; disc 2 gets its own disc-prefixed name
+    assert [i.target_rel for i in plan_missing(conn, scope="all")] == ["Neil Young/Harvest/D2-01 - Intro.flac"]

@@ -96,6 +96,25 @@ def _preflight(staging_dir: Path, library_root: Path, verify: bool, ffmpeg: str 
         return f"staging {staging_dir} and library {library_root} are on different filesystems; placing is a rename"
     if verify and not ffmpeg:
         return "ffmpeg not found on PATH (needed to verify downloads)"
+    return _probe_hard_links(library_root)
+
+
+def _probe_hard_links(library_root: Path) -> str | None:
+    """Placing needs os.link in the library root; find out now, before any Tidal call. Only the probe's own files."""
+    probe = link = None
+    try:
+        fd, name = tempfile.mkstemp(dir=library_root, prefix=".cadence-linkprobe-")
+        os.close(fd)
+        probe = Path(name)
+        link = probe.with_name(probe.name + ".lnk")
+        os.link(probe, link)
+    except OSError as exc:
+        return (f"hard links are required to place files and are unsupported or not permitted on the library mount "
+                f"{library_root} ({exc.strerror or exc})")
+    finally:
+        for p in (link, probe):
+            if p is not None:
+                p.unlink(missing_ok=True)
     return None
 
 
@@ -216,29 +235,51 @@ def _insert_file(conn: sqlite3.Connection, item: FetchItem, rel: str, dest: Path
 
 
 def _move_into_library(src: Path, dst: Path) -> None:
-    """Move src to dst without ever replacing an existing dst; src is left for the caller to delete after the move
-    is committed. Across filesystems (EXDEV) copy to dst's directory first so dst never appears half-written."""
+    """Place src at dst; an existing dst is never replaced, even if it appears at the last instant. dst is only ever
+    created by os.link, which fails atomically with FileExistsError when dst exists (rename/replace are not used,
+    as they would overwrite). A lexists pre-check gives the plain error in the normal case. Same filesystem: link
+    src to dst, then unlink src (a failure to unlink is left for the caller, which retries after its commit).
+    Cross device (EXDEV): copy to a uniquely named .part beside dst, fsync, check the size, link it to dst, remove
+    the .part, so dst never appears half-written; src is left for the caller to remove after commit. If the
+    target cannot hard link there is no overwriting fallback: FetchError, and no .part is left behind."""
     if os.path.lexists(dst):
         raise FileExistsError(errno.EEXIST, "library file already exists", str(dst))
     try:
-        os.rename(src, dst)
-        return
+        os.link(src, dst)
     except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-    tmp = dst.with_name(dst.name + ".part")
+        if exc.errno == errno.EXDEV:
+            return _copy_then_link(src, dst)
+        raise _no_hard_links(dst, exc) if exc.errno in _NO_LINK else exc
+    try:
+        os.unlink(src)
+    except OSError:
+        pass  # dst is placed; the caller removes the staged copy after commit and logs it if that fails too
+
+
+_NO_LINK = (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP)
+
+
+def _no_hard_links(dst: Path, exc: OSError) -> FetchError:
+    return FetchError(f"cannot place {dst}: hard links are unsupported on this target ({exc.strerror or exc}); "
+                      "refusing to fall back to an overwriting move")
+
+
+def _copy_then_link(src: Path, dst: Path) -> None:
+    fd, tmp_name = tempfile.mkstemp(dir=dst.parent, prefix=dst.name + ".", suffix=".part")  # unique: never clobbers
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         shutil.copy2(src, tmp)
         with open(tmp, "r+b") as fh:
             os.fsync(fh.fileno())
         if tmp.stat().st_size != src.stat().st_size:
             raise FetchError(f"copy to {tmp} is {tmp.stat().st_size} bytes, the source is {src.stat().st_size}")
-        if os.path.lexists(dst):  # appeared while copying
-            raise FileExistsError(errno.EEXIST, "library file already exists", str(dst))
-        os.replace(tmp, dst)
-    except BaseException:
+        try:
+            os.link(tmp, dst)  # atomic no-clobber: FileExistsError if dst appeared while copying
+        except OSError as exc:
+            raise _no_hard_links(dst, exc) if exc.errno in (*_NO_LINK, errno.EXDEV) else exc
+    finally:
         tmp.unlink(missing_ok=True)
-        raise
 
 
 def _staged(staging: Path, item: FetchItem, rel: str, ext: str) -> Path:
@@ -320,8 +361,8 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
     except sqlite3.Error as exc:
         conn.rollback()
         raise FetchError(f"placed {rel} but the ledger insert failed ({exc}); import-legacy will pick it up") from exc
-    try:  # only after the commit; the helper never deletes the source
-        staged.unlink(missing_ok=True)  # already gone after a same-filesystem rename
+    try:  # only after the commit; a same-filesystem placement already unlinked the source, a cross-device one did not
+        staged.unlink(missing_ok=True)  # already gone after a same-filesystem link
     except OSError as exc:
         log_event(conn, "fetch.staged_cleanup_failed", rel, f"Placed '{item.title}' by {item.artist} and recorded it, "
                   f"but could not remove the staged copy {staged} ({_safe_message(exc)}); remove it by hand",

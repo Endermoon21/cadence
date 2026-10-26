@@ -50,9 +50,10 @@ class FetchItem:
     variant: str | None
     dest: str                  # 'server' | 'fiio' | 'both'
     target_rel: str            # library-relative path for the expected extension (.flac unless planned otherwise)
+    discs: int = 1             # number of discs on the release; more than one adds the disc prefix to the file name
 
     def target(self, ext: str) -> str:
-        return f"{self.album_dir}/{naming.track_file(self.number, self.title, ext)}"
+        return f"{self.album_dir}/{naming.track_file(self.number, self.title, ext, self.disc, self.discs)}"
 
 
 # ---- names ----
@@ -172,6 +173,9 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
     for a in artists:
         lib = _Library(conn, a["id"], release_id)
         rows = [r for r in conn.execute(_TRACKS, (a["id"], release_id))]
+        discs = {r[0]: r[1] for r in conn.execute(  # every track of the release counts, fetchable or not
+            "SELECT t.release_id, COUNT(DISTINCT t.disc) FROM track t JOIN release rel ON rel.id = t.release_id "
+            "WHERE rel.artist_id = ? GROUP BY t.release_id", (a["id"],))}
         in_group: dict[str, set[int]] = {}
         for r in rows:
             in_group.setdefault(lib.group_of[r["release_id"]], set()).add(r["cid"])
@@ -197,7 +201,7 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
                 album, folder or naming.album_dir(a["name"], album), r["disc"], r["number"],
                 display_title(r["title"], r["version"]), r["tidal_track_id"], r["rec_id"],
                 r["t_dur"] if r["t_dur"] is not None else r["r_dur"], r["isrc"], r["variant"],
-                _dest(conn, a, r["release_id"]), "")
+                _dest(conn, a, r["release_id"]), "", discs.get(r["release_id"], 1))
             item = replace(item, target_rel=item.target(ext))
             twin = lib.owned_under_another_title(g, norm_title(r["title"], r["version"]), item.duration_s)
             if twin:
