@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 from dataclasses import dataclass
 
 # Applied *before* NFKC: NFKC turns U+00B4 into "space + combining acute".
@@ -163,3 +164,20 @@ def split_title(title: str, version: str | None = None, *, release: bool = False
 def norm_title(title: str, version: str | None = None) -> str:
     p = split_title(title, version)
     return p.base if p.variant is None else f"{p.base} [{p.variant}]"
+
+
+_YEAR_IN_RE = re.compile(r"\b(?:19|20)\d\d\b")
+
+
+def remaster_year(title: str, version: str | None = None) -> int | None:
+    """The year attached to a remaster marker: '(2016 Remaster)', '[2008 Remaster]', '(Remastered Stereo 2025 /
+    Take 3)', '- Remastered 2009', or the version field. Only a group that itself contains the word
+    remaster/remastered counts, and only 1900 <= year <= this year; any other 4-digit number is ignored.
+    The latest valid year wins when a group has several. None = no remaster marker, or no year on it."""
+    groups = [m.group(1) if m.group(1) is not None else m.group(2) for m in _GROUP_RE.finditer(title.translate(_PRE))]
+    groups += title.translate(_PRE).split(" - ")[1:]
+    if version:
+        groups.append(version)
+    years = [int(y) for g in groups if "remaster" in fold(g) for y in _YEAR_IN_RE.findall(g)
+             if 1900 <= int(y) <= date.today().year]
+    return max(years, default=None)

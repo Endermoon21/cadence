@@ -39,8 +39,8 @@ def test_sync_groups_editions_and_clusters_and_regroup_is_idempotent():
                     "Night (Deluxe Edition)": "album|night", "Alpha": "single|alpha"}
     canon = {r["isrc"]: conn.execute("SELECT isrc FROM recording WHERE id = ?", (r["canon_id"],)).fetchone()[0]
              for r in conn.execute("SELECT isrc, canon_id FROM recording")}
-    assert canon == {"I1": "I1", "J1": "I1", "K1": "I1", "S1": "I1",     # the 1980 recording wins
-                     "I2": "I2", "J2": "I2", "K2": "I2", "K3": "K3", "K4": "K4"}
+    assert canon == {"I1": "J1", "J1": "J1", "K1": "J1", "S1": "J1",     # the 2018 remaster wins over the 1980 original
+                     "I2": "J2", "J2": "J2", "K2": "J2", "K3": "K3", "K4": "K4"}
     before, counts = snapshot(conn), [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
                                       for t in ("release", "recording", "track")]
     stats = regroup_artist(conn, aid)
@@ -104,11 +104,11 @@ def linked_night():
     return conn, aid
 
 
-def test_owned_through_another_editions_recording_and_standard_edition_is_shown():
+def test_owned_through_another_editions_recording_and_latest_remaster_is_shown():
     conn, aid = linked_night()
     d = report.artist_report(conn, aid)
     assert [(r["title"], r["type"], r["owned"], r["total"], r["state"], r["editions"], r["extras_missing"])
-            for r in d["releases"]] == [("Night", "album", 2, 2, "owned", 3, 2),     # 1980 beats the equal remaster
+            for r in d["releases"]] == [("Night (Remastered)", "album", 2, 2, "owned", 3, 2),   # the remaster beats the equal 1980 original
                                         ("Alpha", "single", 1, 1, "owned", 1, 0)]   # owned via the album's recording
     assert conn.execute("SELECT COUNT(*) FROM file WHERE recording_id IS NOT NULL").fetchone()[0] == 3
 
@@ -190,5 +190,5 @@ def test_live_recordings_cluster_only_within_one_release_group():
     sync_artist(conn, cat, row(conn, aid))
     canon = {r["isrc"]: conn.execute("SELECT isrc FROM recording WHERE id = ?", (r["canon_id"],)).fetchone()[0]
              for r in conn.execute("SELECT isrc, canon_id FROM recording")}
-    assert canon == {"L1": "L1", "L3": "L1", "L2": "L2"}     # same concert's remaster merges, the other show not
+    assert canon == {"L1": "L3", "L3": "L3", "L2": "L2"}     # same concert's remaster merges (and leads), the other show not
     assert report.artist_report(conn, aid)["missing_variant"] == 2

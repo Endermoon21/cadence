@@ -7,6 +7,9 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
+from cadence.identity.grouping import date_year, is_remaster
+from cadence.identity.normalize import remaster_year
+
 _NO_DATE = "9999-99-99"
 _OWN_RELEASES = "artist_id = ? AND role = 'own' AND hidden_reason IS NULL"
 _CLUSTER = "COALESCE(rec.canon_id, rec.id)"  # an ungrouped recording is its own cluster
@@ -18,6 +21,8 @@ class _Edition:
     title: str
     type: str
     date: str | None
+    remaster: bool = False
+    remaster_year: int | None = None
     clusters: set[int] = field(default_factory=set)
 
 
@@ -53,10 +58,12 @@ def _files_by_cluster(conn: sqlite3.Connection) -> dict[int, list[str]]:
 def _load_own(conn: sqlite3.Connection, artist_id: int) -> _Own:
     groups: dict[str, list[_Edition]] = {}
     editions: dict[int, _Edition] = {}
-    for r in conn.execute("SELECT id, title, type, release_date, COALESCE(group_key, 'release:' || id) AS gkey "
+    for r in conn.execute("SELECT id, title, version, type, release_date, COALESCE(group_key, 'release:' || id) AS gkey "
                           f"FROM release WHERE {_OWN_RELEASES} ORDER BY release_date IS NULL, release_date, id",
                           (artist_id,)):
-        editions[r["id"]] = _Edition(r["id"], r["title"], r["type"], r["release_date"])
+        editions[r["id"]] = _Edition(r["id"], r["title"], r["type"], r["release_date"],
+                                      is_remaster(r["title"], r["version"], release=True),
+                                      remaster_year(r["title"], r["version"]) or date_year(r["release_date"]))
         groups.setdefault(r["gkey"], []).append(editions[r["id"]])
     own = _Own(groups, {}, {})
     for t in conn.execute(f"SELECT t.release_id, {_CLUSTER} AS cid, rec.variant FROM track t "
@@ -72,9 +79,19 @@ def _load_own(conn: sqlite3.Connection, artist_id: int) -> _Own:
     return own
 
 
+def _date_num(d: str | None) -> int:
+    digits = (d or "").replace("-", "")
+    return int(digits.ljust(8, "0")[:8]) if digits.isdigit() else 0
+
+
 def _edition_rank(e: _Edition, owned: set[int]) -> tuple:
-    """Best edition: most owned clusters, then the standard (smallest) one, then the earliest."""
-    return (-len(e.clusters & owned), not e.clusters, len(e.clusters), e.date or _NO_DATE, e.id)
+    """Best edition (editions policy, 2026-10-26: the latest remaster is the default): most owned clusters
+    (ownership beats preference), then a remaster, then the latest remaster (the year on its marker, else the
+    year of its date; then its date), then the standard (smallest) one, then the earliest. A group with no
+    remaster edition ranks as before."""
+    return (-len(e.clusters & owned), not e.clusters, not e.remaster,
+            -(e.remaster_year or 0) if e.remaster else 0, -_date_num(e.date) if e.remaster else 0,
+            len(e.clusters), e.date or _NO_DATE, e.id)
 
 
 def _release_rows(own: _Own, owned: set[int]) -> list[dict]:

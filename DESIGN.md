@@ -102,6 +102,8 @@ event_log(...)                                -- what happened and why; powers t
 
 Keep `Artist/Album/NN - Title.ext`. Reasons: the FiiO card scripts (`tidal-card-sync`, `fiio-format-card`) depend on it, the 5,210 existing files already use it, and Jellyfin / Navidrome scan that layout fine. A `[Year]` prefix on the album folder was considered and deferred (it would mean renaming every album folder and touching the card scripts for no scanner benefit). The template lives in one place, `cadence/ledger/naming.py` (`album_dir`, `track_file`); only characters exFAT/macOS cannot hold are changed. Nothing in the library has been renamed.
 
+Editions (decided 2026-10-26): latest remaster is the default edition; originals are secondary and are never deleted. In code: the canonical recording of a cluster is the remaster with the latest year (the year in its remaster tag, else the year of its release date; tie: latest date, then highest id), else the earliest original (`identity/grouping.py`); the edition shown for a release group is the one with the most owned clusters, then a remaster, then the latest remaster, then the fewest tracks, then the earliest (`report.py`).
+
 ### 5a. FiiO card sync (built in)
 
 **Destination tags (user requirement, 2026-10-11).** Every album you request carries a destination: **Server**, **FiiO**, or **both**. You choose it when you ask for the album (checkboxes in the UI), or it falls back to a per-artist default; you can change it later, singly or in bulk. Anything tagged FiiO is the **"set aside" list**, and it is copied to the card **automatically whenever the card is plugged in**.

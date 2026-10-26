@@ -1,10 +1,20 @@
-"""Pure grouping rules: editions of one release, and the same song across editions."""
+"""Pure grouping rules: editions of one release, and the same song across editions.
+
+Canonical recording of a cluster (editions policy, decided 2026-10-26: the latest remaster is the default):
+  1. if any member is a remaster, the LATEST remaster wins, ordered by (remaster_year or 0, remaster_date, id):
+     the year written on the remaster marker first ('(2016 Remaster)'; Tidal often dates a remaster with the
+     original release date, so the date alone cannot rank them), then the release date, then the highest id.
+     A remaster whose marker has no year uses the year of its release date (done by the caller, groups.py);
+  2. otherwise the earliest first_release_date wins (tie: lowest id).
+A recording is a remaster when its own title/version or the release it is on carries the 'remaster' flag of
+normalize.split_title (that covers '(Remastered)', '(2011 Remaster)', '- Remastered 2011' ...). Originals stay
+in the cluster as secondary members; nothing is merged or dropped by this choice, only who is first."""
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import NamedTuple
 
-from cadence.identity.normalize import split_title
+from cadence.identity.normalize import remaster_year, split_title
 
 CLUSTER_TOLERANCE_S = 3
 _NO_DATE = "9999-99-99"  # sorts after every real date
@@ -18,6 +28,18 @@ class RecordingItem(NamedTuple):
     first_release_date: str | None
     variant: str | None = None                       # live / remix / demo ...; None = main version
     groups: frozenset[str] = frozenset()             # release group keys of the releases it is on
+    remaster: bool = False                           # title or a release title carries the 'remaster' flag
+    remaster_date: str | None = None                 # earliest date of the remaster release(s); None = unknown
+    remaster_year: int | None = None                 # remaster year (tag, else release-date year); None = unknown
+
+
+def date_year(d: str | None) -> int | None:
+    """Year of an ISO-ish date ('2024-01-01', '2024'); None if there is none."""
+    return int(d[:4]) if d and d[:4].isdigit() else None
+
+
+def is_remaster(title: str, version: str | None = None, *, release: bool = False) -> bool:
+    return "remaster" in split_title(title, version, release=release).flags
 
 
 def release_group_key(title: str, version: str | None, type: str) -> str:
@@ -40,8 +62,8 @@ def _union(parent: dict[int, int], a: int, b: int) -> None:
 
 
 def cluster_recordings(items: Sequence[RecordingItem]) -> list[list[int]]:
-    """Clusters of ids; the canonical (earliest first_release_date, then lowest id) is first in each list,
-    and the lists are ordered by canonical id.
+    """Clusters of ids; the canonical (see module docstring) is first in each list, the other members follow
+    by earliest first_release_date then id, and the lists are ordered by canonical id.
 
     Same norm_title (which carries the variant label) and duration within CLUSTER_TOLERANCE_S of the cluster's
     first member by duration. Unknown duration or a different title never clusters, except identical ISRCs.
@@ -50,7 +72,7 @@ def cluster_recordings(items: Sequence[RecordingItem]) -> list[list[int]]:
     parent = {i.id: i.id for i in items}
     by_title: dict[tuple[str, str | None], list[tuple[int, int]]] = {}
     by_isrc: dict[str, int] = {}
-    for rid, norm, dur, isrc, _, variant, groups in items:
+    for rid, norm, dur, isrc, _, variant, groups, *_ in items:
         if dur is not None:
             for scope in (groups if variant else (None,)):
                 by_title.setdefault((norm, scope), []).append((dur, rid))
@@ -72,5 +94,14 @@ def cluster_recordings(items: Sequence[RecordingItem]) -> list[list[int]]:
     clusters: dict[int, list[int]] = {}
     for rid in parent:
         clusters.setdefault(_find(parent, rid), []).append(rid)
-    out = [sorted(ids, key=rank.__getitem__) for ids in clusters.values()]
+    remaster = {i.id: (i.remaster_year or 0, i.remaster_date or "", i.id) for i in items if i.remaster}
+    out = []
+    for ids in clusters.values():
+        ids = sorted(ids, key=rank.__getitem__)
+        remasters = [r for r in ids if r in remaster]
+        if remasters:
+            canon = max(remasters, key=remaster.__getitem__)
+            ids.remove(canon)
+            ids.insert(0, canon)
+        out.append(ids)
     return sorted(out, key=lambda ids: ids[0])
