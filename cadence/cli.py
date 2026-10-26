@@ -14,6 +14,9 @@ from cadence.catalog.candidates import format_result, pending_artists, run_candi
 from cadence.catalog.groups import regroup_all, regroup_artist
 from cadence.catalog.link import link_files
 from cadence.catalog.sync import clear_cache, pending_work, sync_all
+from cadence.fetch.plan import plan_missing
+from cadence.fetch.run import DEFAULT_QUALITY, fetch_items
+from cadence.fetch.stream import QUALITIES, ext_for_quality
 from cadence.gate.bucket import Gate, GatePaused
 from cadence.identity.normalize import norm_artist
 from cadence.ledger import db
@@ -158,6 +161,58 @@ def cmd_candidates(args, conn) -> int:
         print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.",
               file=sys.stderr)
     return 1 if res["stopped"] in ("network", "auth") else 0
+
+
+def _fetch_scope(conn, args) -> tuple[int | None, int | None, str | None]:
+    """(artist_id, release_id, error) for --artist / --release (a Tidal release id)."""
+    if args.artist:
+        row = _artist_by_name(conn, args.artist)
+        return (row["id"], None, None) if row else (None, None, f"no artist '{args.artist}'")
+    if args.release:
+        row = conn.execute("SELECT release_id FROM release_source WHERE provider = 'tidal' AND provider_ref = ?",
+                           (str(args.release),)).fetchone()
+        return (None, row[0], None) if row else (None, None, f"no release with Tidal id {args.release} in the ledger")
+    return None, None, None
+
+
+def cmd_fetch(args, conn) -> int:
+    library = args.library or os.environ.get("CADENCE_LIBRARY")
+    staging = args.staging or os.environ.get("CADENCE_STAGING")
+    if not library or (args.execute and not staging):
+        print("fetch: set CADENCE_LIBRARY" + (" and CADENCE_STAGING" if args.execute else "")
+              + " (or --library / --staging)", file=sys.stderr)
+        return 2
+    artist_id, release_id, err = _fetch_scope(conn, args)
+    if err:
+        print(f"fetch: {err}", file=sys.stderr)
+        return 1
+    items = plan_missing(conn, artist_id, release_id, args.include_variants, ext_for_quality(args.quality))
+    if args.limit:
+        items = items[:args.limit]
+    if not args.execute:
+        fetch_items(conn, None, None, items, staging, library, dry_run=True, quality=args.quality)
+        return 0
+    gate = _gate(conn)
+    until = gate.paused_until()
+    if until:
+        print(f"gate paused until {until.isoformat()}; not touching Tidal")
+        return EXIT_PAUSED
+    token = os.path.expanduser(os.environ.get("CADENCE_TIDAL_TOKEN", "~/.config/tidal_dl_ng/token.json"))
+    try:
+        session = _login(gate, token)
+    except GatePaused as p:
+        print(f"gate paused until {p.until.isoformat()}: {p.reason}")
+        return EXIT_PAUSED
+    except Exception as exc:
+        print(f"fetch: cannot start Tidal session: {exc}", file=sys.stderr)
+        return 1
+    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality)
+    if res["stopped"] == "paused":
+        print(f"gate paused until {res['until']}")
+        return EXIT_PAUSED
+    if res["stopped"] == "auth":
+        print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.", file=sys.stderr)
+    return 1 if res["stopped"] or res["failed"] else 0
 
 
 def cmd_quality(args, conn) -> int:
@@ -323,6 +378,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--musicbrainz", action="store_true", help="tiebreak ties with MusicBrainz release groups (network)")
     s.set_defaults(fn=cmd_candidates)
+
+    s = sub.add_parser("fetch", help="download missing tracks from Tidal (dry run unless --execute)")
+    scope = s.add_mutually_exclusive_group()
+    scope.add_argument("--artist", metavar="NAME")
+    scope.add_argument("--release", type=int, metavar="TIDAL_RELEASE_ID")
+    s.add_argument("--quality", choices=QUALITIES, default=DEFAULT_QUALITY)
+    s.add_argument("--staging", metavar="DIR", help="default: $CADENCE_STAGING")
+    s.add_argument("--library", metavar="DIR", help="default: $CADENCE_LIBRARY")
+    s.add_argument("--execute", action="store_true", help="really download and place files (network, writes)")
+    s.add_argument("--limit", type=_at_least_one, metavar="N")
+    s.add_argument("--include-variants", action="store_true", help="also fetch instrumentals, remixes, live ...")
+    s.set_defaults(fn=cmd_fetch)
 
     s = sub.add_parser("cache-clear", help="forget cached Tidal responses")
     s.add_argument("--artist", metavar="NAME")
