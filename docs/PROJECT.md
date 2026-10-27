@@ -29,20 +29,20 @@ Cadence is a **private music ledger and fetcher for one person** (the owner, "Sa
 | What | Where | Notes |
 |---|---|---|
 | **Main repo (Mac)** | `/Users/Ender/music-manager` | The working copy. Python 3.13.9 venv at `.venv/`. |
-| **GitHub remote** | `https://github.com/Endermoon21/cadence` (`origin`) | **Private** (an unauthenticated API call returns 404). Only `main` is pushed, and `origin/main` is at `d2a54e8`, **10 commits behind** the current branch. |
-| **Current branch** | `fetch-ledger-planner` (HEAD `ab49bb5`) | **Local only. Never pushed.** Also local: `fetch-planner-wip` (`8fde791`, an abandoned WIP). |
+| **GitHub remote** | `https://github.com/Endermoon21/cadence` (`origin`) | **Private** (an unauthenticated API call returns 404). Branches on it: `main` (at `d2a54e8`, **not moved**, 11 commits behind the working branch) and `fetch-ledger-planner` (pushed 2026-10-27, in sync with the Mac). |
+| **Current branch** | `fetch-ledger-planner` (code `ab49bb5`, plus docs commits on top) | The branch to use. Also local only: `fetch-planner-wip` (`8fde791`, an abandoned WIP). |
 | **UI design repo** | `/Users/Ender/cadence-koi-ui` and `https://github.com/Endermoon21/cadence-koi-ui` | Private. One commit, `fd97a25`. Design source only. |
 | **Live design canvas** | https://claude.ai/artifact/6YfnW56BrZAwfcMyhB8yPh | Anyone-with-the-link. Same files as `cadence-koi-ui/design/`. |
 | **Production (Unraid)** | host `Tower`: LAN `10.0.0.48`, Tailscale `100.69.34.110` | Runs Cadence in containers. Code there is at `6968b87` (before the fallbacks). |
 
-> **Consequence:** the only complete copy of the latest code is the Mac working tree. If the Mac is lost, `ab49bb5` and 9 earlier commits are gone. Pushing `fetch-ledger-planner` to `origin` is the fix (not done yet, because it was not requested).
+> **Backup state:** the latest code is on GitHub as the `fetch-ledger-planner` branch (and on the Mac). `main` on GitHub is deliberately left at `d2a54e8`; merging or fast-forwarding it is an owner decision that has not been made.
 
 ### 1.2 Get a working copy
 
 ```bash
-# from GitHub (gets main only, 10 commits old; the branch must be pushed first to get the latest)
+# from GitHub (private repo: needs a login first)
 gh auth login -h github.com          # the saved gh token is currently invalid
-git clone https://github.com/Endermoon21/cadence.git && cd cadence
+git clone -b fetch-ledger-planner https://github.com/Endermoon21/cadence.git && cd cadence
 
 # on the Mac, the real thing
 cd ~/music-manager
@@ -404,7 +404,7 @@ Settled direction: a quiet koi pond at night, heavy teal/green highlights, laid-
 - Smoke leftovers on Unraid await the owner's OK to delete.
 
 **Repo hygiene**
-- `fetch-ledger-planner` and its 10 commits are unpushed; `docs/CADENCE.md` is untracked; `DESIGN.md` is partly stale.
+- `main` on GitHub is 11 commits behind `fetch-ledger-planner` (left alone on purpose). `DESIGN.md` is partly historical (banner added); `docs/CADENCE.md` is superseded (banner added). The saved `gh` token is invalid; the sandbox also blocks writes to `.git/config`, so `git init`/`push -u` need the sandbox off.
 
 ---
 
