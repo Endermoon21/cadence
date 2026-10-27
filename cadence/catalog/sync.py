@@ -108,7 +108,7 @@ def _upsert_track(conn: sqlite3.Connection, release_id: int, recording_id: int, 
 def _upsert_release(conn: sqlite3.Connection, artist_id: int, r: ReleaseDTO, role: str) -> int | None:
     """Release id, or None when another artist already owns this Tidal release."""
     values = (r.title, norm_title(r.title, r.version), r.version, r.type, r.release_date,
-              _b(r.explicit), r.num_tracks, r.upc, _b(r.available))
+              _b(r.explicit), r.num_tracks, r.upc, _b(r.available), r.num_volumes)
     ref = str(r.tidal_id)
     row = conn.execute("SELECT r.id, r.artist_id, r.role FROM release_source s JOIN release r "
                        "ON r.id = s.release_id WHERE s.provider = 'tidal' AND s.provider_ref = ?",
@@ -116,7 +116,7 @@ def _upsert_release(conn: sqlite3.Connection, artist_id: int, r: ReleaseDTO, rol
     if row is None:
         rid = conn.execute(
             "INSERT INTO release(artist_id, role, title, norm_title, version, type, release_date, "
-            "explicit, num_tracks, upc, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "explicit, num_tracks, upc, available, num_volumes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (artist_id, role, *values)).lastrowid
         conn.execute("INSERT INTO release_source(release_id, provider, provider_ref) "
                      "VALUES (?, 'tidal', ?)", (rid, ref))
@@ -126,6 +126,7 @@ def _upsert_release(conn: sqlite3.Connection, artist_id: int, r: ReleaseDTO, rol
     conn.execute(
         "UPDATE release SET artist_id = ?, role = ?, title = ?, norm_title = ?, version = ?, type = ?, "
         "release_date = ?, explicit = ?, num_tracks = ?, upc = ?, available = ?, "
+        "num_volumes = COALESCE(?, num_volumes), "
         "hidden_reason = CASE WHEN hidden_reason = ? THEN NULL ELSE hidden_reason END, "
         "updated_at = datetime('now') WHERE id = ?", (artist_id, role, *values, NOT_IN_LISTING, row["id"]))
     conn.execute("UPDATE release_source SET seen_at = datetime('now') "

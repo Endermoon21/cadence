@@ -121,6 +121,10 @@ def _num_tracks(v) -> int | None:
     return int(v) if v is not None and int(v) >= 0 else None
 
 
+def _num_volumes(v) -> int | None:
+    return int(v) if v is not None and int(v) >= 1 else None
+
+
 # tidalapi's Track.parse_track only keeps isrc/version when the track is streamable, which would merge
 # unavailable variants into the main recording. So DTOs are built from the raw JSON, not parsed objects.
 def release_dto(j: dict) -> ReleaseDTO:
@@ -129,7 +133,7 @@ def release_dto(j: dict) -> ReleaseDTO:
         type=base.release_type(j.get("type")), release_date=_date(j.get("releaseDate")),
         explicit=_opt_bool(j.get("explicit")), num_tracks=_num_tracks(j.get("numberOfTracks")),
         upc=_upc(j.get("upc")), available=_opt_bool(j.get("streamReady")),
-        artists=_json_refs(j.get("artists")))
+        artists=_json_refs(j.get("artists")), num_volumes=_num_volumes(j.get("numberOfVolumes")))
 
 
 def track_dto(j: dict) -> TrackDTO:

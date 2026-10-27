@@ -42,6 +42,7 @@ class ReleaseDTO:
     upc: str | None
     available: bool | None
     artists: tuple[ArtistRef, ...]
+    num_volumes: int | None = None  # Tidal's numberOfVolumes (disc count); None when absent
 
 
 class BudgetExceeded(Exception):

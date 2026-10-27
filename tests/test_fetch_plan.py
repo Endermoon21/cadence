@@ -203,3 +203,94 @@ def test_disc_count_covers_tracks_that_are_not_fetchable_or_not_missing():
     conn.execute("UPDATE track SET tidal_id = NULL WHERE disc = 1")
     # the owned cluster is not planned, so the old name is never claimed again; disc 2 gets its own disc-prefixed name
     assert [i.target_rel for i in plan_missing(conn, scope="all")] == ["Neil Young/Harvest/D2-01 - Intro.flac"]
+
+
+def test_null_num_volumes_with_a_disc_two_row_is_multi_disc_as_before():
+    conn, a, rel, r1, r2 = two_discs()
+    assert conn.execute("SELECT num_volumes FROM release").fetchone()[0] is None
+    assert {i.discs for i in plan_missing(conn, scope="all")} == {2}
+    conn.execute("UPDATE track SET available = 0 WHERE disc = 2")  # unavailable and unlinked rows count too
+    assert [i.target_rel for i in plan_missing(conn, scope="all")] == ["Neil Young/Harvest/D1-01 - Intro.flac"]
+    conn.execute("UPDATE track SET available = NULL, tidal_id = NULL WHERE disc = 2")
+    assert [i.target_rel for i in plan_missing(conn, scope="all")] == ["Neil Young/Harvest/D1-01 - Intro.flac"]
+
+
+def test_volume_count_one_with_a_real_disc_two_row_is_still_multi_disc_so_names_do_not_collide():
+    conn, a, rel, r1, r2 = two_discs()
+    conn.execute("UPDATE release SET num_volumes = 1")
+    assert [(i.discs, i.target_rel) for i in plan_missing(conn, scope="all")] == \
+        [(2, "Neil Young/Harvest/D1-01 - Intro.flac"), (2, "Neil Young/Harvest/D2-01 - Intro.flac")]
+
+
+def test_volume_count_one_and_only_disc_one_rows_keeps_single_disc_names():
+    conn, a, rel = seed()
+    add_track(conn, rel, add_recording(conn, a, "Song"), 1, "Song", 1)
+    for n in (1, None, 0):  # NULL and < 1 are not usable counts
+        conn.execute("UPDATE release SET num_volumes = ?", (n,))
+        assert [(i.discs, i.target_rel) for i in plan_missing(conn, scope="all")] == \
+            [(1, "Neil Young/Harvest/01 - Song.flac")]
+    conn.execute("UPDATE release SET num_volumes = 2")  # Tidal says two discs even though only disc 1 has rows
+    assert [i.discs for i in plan_missing(conn, scope="all")] == [2]
+
+
+# ---- legacy unprefixed files on multi-disc albums ----
+
+def legacy_foo(volumes, discs=1):
+    """An album with 'Foo' as track 2 (Tidal: 249 s) and an unlinked legacy `02 - Foo.flac` of 245 s."""
+    conn, a, rel = seed()
+    add_track(conn, rel, add_recording(conn, a, "Intro"), 1, "Intro", 1, dur=100)
+    add_track(conn, rel, add_recording(conn, a, "Foo", dur=249), 2, "Foo", 2, dur=249)
+    if discs == 2:
+        add_track(conn, rel, add_recording(conn, a, "Outro"), 1, "Outro", 3, dur=100, disc=2)
+    conn.execute("UPDATE release SET num_volumes = ?", (volumes,))
+    add_file(conn, "Neil Young/Harvest/02 - Foo.flac", a)
+    conn.execute("UPDATE file SET duration_s = 245")
+    return conn
+
+
+def test_multi_disc_legacy_file_with_the_same_title_and_number_is_owned_whatever_its_duration():
+    conn = legacy_foo(2, discs=2)
+    skipped = []
+    assert titles(plan_missing(conn, skipped=skipped)) == ["Intro", "Outro"]
+    [(item, path)] = skipped
+    assert (item.title, path) == ("Foo", "Neil Young/Harvest/02 - Foo.flac")
+    # only the same number: a tag title or a 'NN - Title' name is enough, a different number is not
+    conn.execute("UPDATE file SET path = 'Neil Young/Harvest/05 - Foo.flac'")
+    assert titles(plan_missing(conn)) == ["Intro", "Foo", "Outro"]
+    conn.execute("UPDATE file SET path = 'Neil Young/Harvest/x.flac', tag_title = 'Foo', tag_track = '2/12'")
+    assert titles(plan_missing(conn)) == ["Intro", "Outro"]
+
+
+def test_multi_disc_rule_needs_the_exact_title_so_a_live_variant_does_not_own_the_studio_track():
+    conn = legacy_foo(2, discs=2)
+    conn.execute("UPDATE file SET path = 'Neil Young/Harvest/02 - Foo (Live).flac'")
+    skipped = []
+    assert titles(plan_missing(conn, skipped=skipped)) == ["Intro", "Foo", "Outro"]
+    assert skipped == []
+
+
+def test_one_legacy_file_is_not_claimed_by_same_numbered_same_titled_tracks_on_two_discs():
+    conn, a, rel, r1, r2 = two_discs()
+    add_file(conn, "Neil Young/Harvest/01 - Intro.flac", a)  # unlinked, matches both discs' track 1
+    skipped = []
+    assert [i.target_rel for i in plan_missing(conn, scope="all", skipped=skipped)] == \
+        ["Neil Young/Harvest/D1-01 - Intro.flac", "Neil Young/Harvest/D2-01 - Intro.flac"]
+    assert skipped == []
+
+
+def test_multi_disc_rule_ignores_linked_files_so_disc_two_can_repeat_a_title_and_number():
+    conn, a, rel, r1, r2 = two_discs()
+    add_file(conn, "Neil Young/Harvest/01 - Intro.flac", a, r1)  # owns disc 1's Intro only
+    assert [i.target_rel for i in plan_missing(conn, scope="all")] == ["Neil Young/Harvest/D2-01 - Intro.flac"]
+
+
+def test_single_disc_legacy_file_outside_the_duration_tolerance_is_still_fetched():
+    conn = legacy_foo(1)
+    skipped = []
+    assert titles(plan_missing(conn, skipped=skipped)) == ["Intro", "Foo"]
+    assert skipped == []
+    conn.execute("UPDATE file SET duration_s = 248.5, tag_title = 'Foo'")  # within 3 s: the old rule still applies
+    skipped = []
+    assert titles(plan_missing(conn, skipped=skipped)) == ["Intro"]
+    assert [p for _, p in skipped] == ["Neil Young/Harvest/02 - Foo.flac"]
+

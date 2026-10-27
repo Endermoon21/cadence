@@ -10,6 +10,7 @@ group is reused as is; otherwise the album title without remaster/edition marker
 files the user already has (same release group, similar title, duration within 3 s) are skipped and reported."""
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -21,6 +22,7 @@ _TYPE_RANK = {"album": 0, "ep": 1, "single": 2, "compilation": 3, "other": 4}
 _NO_DATE = "9999-99-99"
 _MARKERS = {"remaster", "deluxe", "edition"}
 SAME_DURATION_S = 3
+_NUMBERED_NAME = re.compile(r"^\s*(\d+)\s*-\s*(.+)$")  # 'NN - Title' (extension already removed)
 
 _REL_FILTER = "rel.artist_id = ?1 AND ((rel.role = 'own' AND rel.hidden_reason IS NULL) OR rel.id = ?2)"
 _TRACKS = (
@@ -107,6 +109,15 @@ def _pick(rows: list) -> sqlite3.Row:
                                     r["release_date"] or _NO_DATE, r["release_id"], r["disc"], r["number"]))
 
 
+def _title_and_number(path: str, tag_title: str | None, tag_track: str | None) -> tuple[set[str], set[int]]:
+    """Normalised titles and track numbers a file claims, from its tags and from an `NN - Title` file name."""
+    name = _NUMBERED_NAME.match(path.rsplit("/", 1)[-1].rsplit(".", 1)[0])
+    tag_no = re.match(r"\s*(\d+)", tag_track or "")
+    titles = {norm_title(t) for t in (tag_title, name and name.group(2)) if t}
+    numbers = {int(m.group(1)) for m in (name, tag_no) if m}
+    return titles, numbers
+
+
 class _Library:
     """What the artist's files say about each release group: their folders and their (title, duration)."""
 
@@ -123,7 +134,9 @@ class _Library:
             rec_groups.setdefault(t["rid"], set()).add(self.group_of[t["relid"]])
         self.dirs: dict[str, Counter] = {}
         self.files: dict[str, list[tuple[str, float, str]]] = {}
-        for f in conn.execute("SELECT path, recording_id, tag_title, duration_s FROM file WHERE artist_id = ?", (artist_id,)):
+        self.unlinked: dict[str, list[tuple[set[str], set[int], str]]] = {}  # (titles, track numbers, path)
+        for f in conn.execute("SELECT path, recording_id, tag_title, tag_track, duration_s FROM file "
+                              "WHERE artist_id = ?", (artist_id,)):
             if "/" not in f["path"]:
                 continue
             folder = f["path"].rsplit("/", 1)[0]
@@ -134,17 +147,30 @@ class _Library:
                 self.dirs.setdefault(g, Counter())[folder] += 1
                 if f["tag_title"] and f["duration_s"] is not None:
                     self.files.setdefault(g, []).append((norm_title(f["tag_title"]), f["duration_s"], f["path"]))
+                if f["recording_id"] is None:
+                    titles, numbers = _title_and_number(f["path"], f["tag_title"], f["tag_track"])
+                    self.unlinked.setdefault(g, []).append((titles, numbers, f["path"]))
 
     def folder(self, group: str) -> str | None:
         votes = self.dirs.get(group)
         return max(sorted(votes), key=votes.__getitem__) if votes else None
 
-    def owned_under_another_title(self, group: str, title: str, duration_s: int | None) -> str | None:
-        if duration_s is None:
-            return None
-        for nt, dur, path in self.files.get(group, ()):
-            if abs(dur - duration_s) <= SAME_DURATION_S and _related(nt, title):
-                return path
+    def owned_under_another_title(self, group: str, title: str, duration_s: int | None, number: int | None = None,
+                                  multi_disc: bool = False, ambiguous: bool = False) -> str | None:
+        if duration_s is not None:
+            for nt, dur, path in self.files.get(group, ()):
+                if abs(dur - duration_s) <= SAME_DURATION_S and _related(nt, title):
+                    return path
+        if multi_disc and number is not None:
+            # Legacy files on a multi-disc album are named `NN - Title` with no disc prefix, and their length can
+            # differ from Tidal's by more than the tolerance (other master), so the duration rule misses them and
+            # the track would be fetched again as `D1-NN - Title`. The same title (exactly: a live or other variant
+            # is another recording) and the same track number is enough here. Only unlinked files count: a linked one
+            # already owns its own track (disc 2 may repeat title and number). When tracks on several discs match the
+            # same file (`ambiguous`) it cannot tell which one it is, so none is claimed.
+            for titles, numbers, path in self.unlinked.get(group, ()):
+                if not ambiguous and number in numbers and title in titles:
+                    return path
         return None
 
 
@@ -173,9 +199,10 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
     for a in artists:
         lib = _Library(conn, a["id"], release_id)
         rows = [r for r in conn.execute(_TRACKS, (a["id"], release_id))]
-        discs = {r[0]: r[1] for r in conn.execute(  # every track of the release counts, fetchable or not
-            "SELECT t.release_id, COUNT(DISTINCT t.disc) FROM track t JOIN release rel ON rel.id = t.release_id "
-            "WHERE rel.artist_id = ? GROUP BY t.release_id", (a["id"],))}
+        discs = {r[0]: r[1] for r in conn.execute(  # Tidal's volume count (else 1) or the top disc of any row
+            "SELECT rel.id, MAX(CASE WHEN rel.num_volumes >= 1 THEN rel.num_volumes ELSE 1 END, "
+            "COALESCE((SELECT MAX(t.disc) FROM track t WHERE t.release_id = rel.id), 1)) "
+            "FROM release rel WHERE rel.artist_id = ?", (a["id"],))}
         in_group: dict[str, set[int]] = {}
         for r in rows:
             in_group.setdefault(lib.group_of[r["release_id"]], set()).add(r["cid"])
@@ -190,9 +217,12 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
             clusters.setdefault(r["cid"], []).append(r)
         picked = sorted((_pick(rs) for rs in clusters.values()),
                         key=lambda r: (r["release_date"] or _NO_DATE, r["release_id"], r["disc"], r["number"]))
-        for r in picked:
-            if r["variant"] is not None and not include_variants:
-                continue
+        planned = [r for r in picked if r["variant"] is None or include_variants]
+        same_slot: dict[tuple, set[int]] = {}  # (group, number, title) -> discs holding such a planned track
+        for r in planned:
+            same_slot.setdefault((lib.group_of[r["release_id"]], r["number"], norm_title(r["title"], r["version"])),
+                                 set()).add(r["disc"])
+        for r in planned:
             g = lib.group_of[r["release_id"]]
             folder = lib.folder(g)
             album = folder.rsplit("/", 1)[-1] if folder else strip_markers(r["release_title"], release=True)
@@ -203,7 +233,9 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
                 r["t_dur"] if r["t_dur"] is not None else r["r_dur"], r["isrc"], r["variant"],
                 _dest(conn, a, r["release_id"]), "", discs.get(r["release_id"], 1))
             item = replace(item, target_rel=item.target(ext))
-            twin = lib.owned_under_another_title(g, norm_title(r["title"], r["version"]), item.duration_s)
+            key = norm_title(r["title"], r["version"])
+            twin = lib.owned_under_another_title(g, key, item.duration_s, item.number, item.discs > 1,
+                                                 len(same_slot[(g, item.number, key)]) > 1)
             if twin:
                 if skipped is not None:
                     skipped.append((item, twin))

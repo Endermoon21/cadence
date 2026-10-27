@@ -101,9 +101,16 @@ def test_release_dto_mapping_from_raw_json():
     cat, _, _ = catalog(s)
     a, b, c = cat.artist_releases(7)
     assert a == ReleaseDTO(1, "Album 1", "Deluxe", "ep", "2021-02-03", None, 3, "00197207651569", True,
-                           (ArtistRef(7, "Will"), ArtistRef(8, "X")))
+                           (ArtistRef(7, "Will"), ArtistRef(8, "X")), 1)
     assert (b.type, b.release_date, b.upc, b.num_tracks, b.available) == ("other", None, None, None, None)
     assert (c.type, c.upc, c.version) == ("other", None, None)
+
+
+def test_release_dto_num_volumes_from_raw_json():
+    assert tidal.release_dto(raw_album(1, numberOfVolumes=3)).num_volumes == 3
+    assert tidal.release_dto(raw_album(1, numberOfVolumes=None)).num_volumes is None
+    assert tidal.release_dto(raw_album(1, numberOfVolumes=0)).num_volumes is None
+    assert tidal.release_dto({k: v for k, v in raw_album(1).items() if k != "numberOfVolumes"}).num_volumes is None
 
 
 def test_track_paging_and_dto_mapping_from_raw_json():

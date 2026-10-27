@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import requests
 
@@ -55,6 +56,25 @@ def test_own_vs_appears_on_by_first_artist_and_tracks_only_for_own():
     assert conn.execute("SELECT provider_ref FROM release_source WHERE provider = 'tidal' "
                         "ORDER BY provider_ref").fetchall()[0][0] == "10"
     assert row(conn, aid)["catalog_synced_at"]
+
+
+def test_sync_stores_num_volumes_and_a_resync_updates_it():
+    two, unknown = replace(rel(10, "Two Discs", [WILL], "album"), num_volumes=2), rel(11, "Unknown", [WILL], "album")
+    conn, aid, cat = will_setup([two, unknown], {10: [trk(100, "A", 100, "I1")], 11: [trk(110, "B", 100, "I2")]})
+    sync_artist(conn, cat, row(conn, aid))
+    assert dict(conn.execute("SELECT title, num_volumes FROM release")) == {"Two Discs": 2, "Unknown": None}
+    cat._releases[1] = [replace(two, num_volumes=1), unknown]
+    sync_artist(conn, cat, row(conn, aid))
+    assert dict(conn.execute("SELECT title, num_volumes FROM release")) == {"Two Discs": 1, "Unknown": None}
+
+
+def test_a_resync_without_numberofvolumes_keeps_the_stored_count():
+    two = replace(rel(10, "Two Discs", [WILL], "album"), num_volumes=2)
+    conn, aid, cat = will_setup([two], {10: [trk(100, "A", 100, "I1")]})
+    sync_artist(conn, cat, row(conn, aid))
+    cat._releases[1] = [replace(two, num_volumes=None)]
+    sync_artist(conn, cat, row(conn, aid))
+    assert conn.execute("SELECT num_volumes FROM release").fetchone()[0] == 2
 
 
 def test_recording_deduped_by_isrc_across_single_and_album():

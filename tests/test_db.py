@@ -1,4 +1,5 @@
 import json
+import shutil
 import sqlite3
 
 import pytest
@@ -18,11 +19,11 @@ def mem():
 
 def test_migrate_creates_schema_and_is_idempotent():
     conn = db.connect(":memory:")
-    assert db.migrate(conn) == [1, 2, 3, 4]
+    assert db.migrate(conn) == [1, 2, 3, 4, 5]
     assert db.migrate(conn) == []
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert TABLES <= names
-    assert [r["version"] for r in conn.execute("SELECT version FROM schema_version")] == [1, 2, 3, 4]
+    assert [r["version"] for r in conn.execute("SELECT version FROM schema_version")] == [1, 2, 3, 4, 5]
 
 
 def test_connect_pragmas_and_row_factory():
@@ -53,6 +54,20 @@ def test_each_migration_is_one_transaction(tmp_path):
     assert [r[0] for r in conn.execute("SELECT version FROM schema_version")] == [1]
     (tmp_path / "002_b.sql").write_text("CREATE TABLE b(x);")
     assert db.migrate(conn, tmp_path) == [2]
+
+
+def test_migration_005_adds_a_nullable_num_volumes_to_an_existing_ledger(tmp_path):
+    for f in db.MIGRATIONS_DIR.glob("00[1-4]_*.sql"):
+        shutil.copy(f, tmp_path / f.name)
+    conn = db.connect(":memory:")
+    assert db.migrate(conn, tmp_path) == [1, 2, 3, 4]
+    conn.execute("INSERT INTO artist(name, norm_name) VALUES ('A', 'a')")
+    conn.execute("INSERT INTO release(artist_id, title, norm_title, type) VALUES (1, 'T', 't', 'album')")
+    conn.commit()
+    assert db.migrate(conn) == [5]
+    assert conn.execute("SELECT num_volumes FROM release").fetchone()[0] is None
+    conn.execute("UPDATE release SET num_volumes = 2")
+    assert conn.execute("SELECT num_volumes FROM release").fetchone()[0] == 2
 
 
 def test_log_event():
