@@ -1,7 +1,9 @@
 # Cadence — design doc (working title)
 
 A purpose-built replacement for Aurral + Lidarr. Tidal's catalog is the source of truth, one SQLite ledger tracks what you own, and a worker fetches what's missing.
-Status: **design draft, 2026-10-11. No code yet.** Nothing here has been built or tested; items marked ⚠ are unverified assumptions that Milestone 0 must settle.
+> **Updated 2026-10-27.** This is the original design doc and is partly historical. Code exists now (milestones 0-2 are built) and **`docs/PROJECT.md` is the current, complete reference**. Superseded here: Python 3.12 is now 3.13; the downloader is the in-house fetch (`cadence/fetch/`), not tiddl (§3, §8b, §11.3); Soulseek and OrpheusDL were added as lossless fallbacks behind a Mullvad VPN (§11.6 describes the older YouTube Music fallback); the visual direction (§12.4) is decided: koi pond, see `cadence-koi-ui/HANDOFF.md`.
+
+Original status line: design draft, 2026-10-11. No code yet. Items marked ⚠ were unverified assumptions that Milestone 0 had to settle.
 
 ## 1. Why
 
@@ -336,8 +338,8 @@ Bottom tab bar on phone, left rail on desktop: **Inbox · Library · Add · Acti
 ### 12.3 Shared components
 Destination chips (Server / FiiO / Both), state badges, size meter, "why?" popover, undo toast, bottom-sheet request dialog, skeleton loaders. Tap targets ≥44 px, no hover-only controls, works in light and dark.
 
-### 12.4 Visual direction (needs your pick)
-Album-art-forward, dark by default. Candidate: reuse the **Ender "Lily Pond"** tokens from your tracker design system (deep forest, moss/amber accents, Fraunces serif) for a cohesive personal-app family, or a neutral dark "player" look.
+### 12.4 Visual direction (DECIDED 2026-10-27: koi pond)
+Decided: a pixel-art **koi pond** look (16-bit sprites, teal/lily-green highlights, laid-back dark water tones, audiophile details such as a turntable, VU meter and cassette). No existing design system is reused. Tokens, sprites, screens and rules are in the `cadence-koi-ui` repo (`HANDOFF.md`, `tokens.css`, `design/`) and on the live canvas https://claude.ai/artifact/6YfnW56BrZAwfcMyhB8yPh. The earlier options (Ender "Lily Pond" tokens, or a neutral dark player look) were not chosen.
 
 ### 12.5 Frontend stack
 Server-rendered Jinja + HTMX + a little Alpine, SSE for live parts, plain CSS with tokens, no build step, installable PWA. The one rich widget (drag-to-order on the FiiO list) uses SortableJS as an island. Escape hatch: if a screen outgrows this, that screen alone becomes a small SPA.
