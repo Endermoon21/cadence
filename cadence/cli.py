@@ -14,6 +14,7 @@ from cadence.catalog.candidates import format_result, pending_artists, run_candi
 from cadence.catalog.groups import regroup_all, regroup_artist
 from cadence.catalog.link import link_files
 from cadence.catalog.sync import clear_cache, pending_work, sync_all
+from cadence.fetch.fallback import NAMES as FALLBACK_NAMES, fallbacks_from_env
 from cadence.fetch.plan import plan_missing
 from cadence.fetch.run import DEFAULT_QUALITY, _report_plan, fetch_items
 from cadence.fetch.stream import QUALITIES, ext_for_quality
@@ -182,6 +183,11 @@ def cmd_fetch(args, conn) -> int:
         print("fetch: set CADENCE_LIBRARY" + (" and CADENCE_STAGING" if args.execute else "")
               + " (or --library / --staging)", file=sys.stderr)
         return 2
+    names = args.fallback or [n.strip() for n in os.environ.get("CADENCE_FALLBACKS", "").split(",") if n.strip()]
+    fallbacks, err = fallbacks_from_env(names)
+    if err:  # also in a dry run, so a mistake shows before --execute
+        print(f"fetch: {err}", file=sys.stderr)
+        return 2
     artist_id, release_id, err = _fetch_scope(conn, args)
     if err:
         print(f"fetch: {err}", file=sys.stderr)
@@ -193,7 +199,11 @@ def cmd_fetch(args, conn) -> int:
     if args.scope == "all" and release_id is None:
         print(f"WARNING: --scope all plans {len(items)} track(s) across {len({i.album_dir for i in items})} release(s), "
               "including whole releases you do not own at all (default scope is partial)")
+    if fallbacks and args.quality not in ("LOSSLESS", "HI_RES_LOSSLESS"):
+        print(f"fallbacks are unused at {args.quality} (they only run for lossless requests)")
     if not args.execute:
+        print("fallbacks: " + (", ".join(f.name for f in fallbacks) + " (only for tracks Tidal serves lossy; "
+                               "not contacted in a dry run)" if fallbacks else "none"))
         fetch_items(conn, None, None, items, staging, library, dry_run=True, quality=args.quality, plan=plan)
         return 0
     gate = _gate(conn)
@@ -213,7 +223,8 @@ def cmd_fetch(args, conn) -> int:
         _report_plan(plan, items, print)
         print(f"fetch: cannot start Tidal session: {exc}", file=sys.stderr)
         return 1
-    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality, plan=plan)
+    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality, plan=plan,
+                      fallbacks=fallbacks)
     if res["stopped"] == "paused":
         print(f"gate paused until {res['until']}")
     if res["stopped"] == "auth":
@@ -421,6 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--execute", action="store_true", help="really download and place files (network, writes)")
     s.add_argument("--limit", type=_at_least_one, metavar="N")
     s.add_argument("--include-variants", action="store_true", help="also fetch instrumentals, remixes, live ...")
+    s.add_argument("--fallback", choices=FALLBACK_NAMES, action="append", metavar="{" + ",".join(FALLBACK_NAMES) + "}",
+                   help="where to look for a lossless copy of a track Tidal serves lossy; repeatable, tried in order "
+                        "(default: $CADENCE_FALLBACKS, a comma list)")
     s.set_defaults(fn=cmd_fetch)
 
     s = sub.add_parser("cache-clear", help="forget cached Tidal responses")

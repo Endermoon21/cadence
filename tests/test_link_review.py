@@ -211,7 +211,7 @@ def test_migration_006_adds_link_review_to_a_ledger_at_version_5(tmp_path):
     conn.execute("INSERT INTO file(path, artist_id) VALUES ('x.flac', 1)")
     conn.commit()
     assert "link_review" not in {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
-    assert db.migrate(conn) == [6]
+    assert db.migrate(conn) == [6, 7]
     assert conn.execute("SELECT COUNT(*) FROM file").fetchone()[0] == 1
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(link_review)")}
     assert cols == {"file_id", "reason", "candidates", "created_at"}

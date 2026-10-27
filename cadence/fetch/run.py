@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import mutagen
 import mutagen.flac
@@ -20,6 +22,7 @@ import mutagen.mp4
 import requests
 
 from cadence.catalog.sync import _is_dead_connection, _named, _safe_message, _statuses
+from cadence.fetch.fallback import Acquired, FallbackMiss, VpnDown
 from cadence.fetch.plan import FetchItem, Plan
 from cadence.fetch.stream import StreamInfo, StreamRefused, ext_for_quality, resolve_stream
 from cadence.gate.bucket import Gate, GatePaused
@@ -33,6 +36,9 @@ MAX_NETWORK_FAILURES = 3
 MAX_EDITION_PROBES = 4  # other Tidal tracks of the same recording asked for per item when the planned one is served lossy
 HTTP_TIMEOUT = (10, 60)
 CHUNK = 1 << 20
+LOSSLESS = ("LOSSLESS", "HI_RES_LOSSLESS")
+VIA = "via "  # a note starting with this marks an item placed from a fallback source
+_NO_STREAM = SimpleNamespace(sample_rate=None, bit_depth=None, bitrate=None)  # a fallback file has no Tidal stream facts
 
 
 class FetchError(Exception):
@@ -254,15 +260,16 @@ def _file_facts(path: Path, stream: StreamInfo) -> dict:
 
 # ---- one track ----
 
-def _insert_file(conn: sqlite3.Connection, item: FetchItem, rel: str, dest: Path, facts: dict, requested: str) -> str:
+def _insert_file(conn: sqlite3.Connection, item: FetchItem, rel: str, dest: Path, facts: dict, requested: str,
+                 source: str = "tidal") -> str:
     lossy, received = quality_facts.facts(facts["codec"], facts["sample_rate"], facts["bit_depth"], facts["bitrate"])
     st = dest.stat()
     conn.execute(
         "INSERT INTO file(path, artist_id, recording_id, match, match_score, source, codec, sample_rate, bit_depth, "
         "bitrate, duration_s, size, mtime, tag_title, tag_albumartist, tag_album, tag_track, tag_disc, tag_isrc, "
-        "lossy, quality_requested, quality_received, seen_at) VALUES (?, ?, ?, 'manual', 1.0, 'tidal', ?, ?, ?, ?, ?, "
+        "lossy, quality_requested, quality_received, seen_at) VALUES (?, ?, ?, 'manual', 1.0, ?, ?, ?, ?, ?, ?, "
         "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (rel, item.artist_id, item.recording_id, facts["codec"], facts["sample_rate"], facts["bit_depth"],
+        (rel, item.artist_id, item.recording_id, source, facts["codec"], facts["sample_rate"], facts["bit_depth"],
          facts["bitrate"], facts["duration_s"], st.st_size, int(st.st_mtime), item.title, item.artist, item.release,
          str(item.number), str(item.disc), item.isrc, lossy, requested, received,
          datetime.now(timezone.utc).isoformat(timespec="seconds")))
@@ -383,10 +390,166 @@ def _probe_editions(conn: sqlite3.Connection, session, gate: Gate, item: FetchIt
     return None, tried
 
 
+def _place(conn, library: Path, staging: Path, item: FetchItem, rel: str, staged: Path, facts: dict, quality: str,
+           tidal_id: int, audio_quality: str | None, extra: dict, source: str = "tidal",
+           note: str = "") -> tuple[str, str]:
+    """Link the verified, tagged `staged` file into the library at `rel`, record it and clean up staging: the tail of a
+    fetch, shared by the Tidal path and the fallback sources. (status, note): 'placed', or the `_taken` result when the
+    path is occupied (the staged copy then stays). Nothing existing is overwritten; the held lossy sibling of a FLAC is
+    removed only after the commit. `extra` is added to the fetch.placed data."""
+    dest = library / rel
+    if taken := _taken(conn, library, item, rel, staged):
+        return taken
+    new_dirs = [d for d in (dest.parent, *dest.parent.parents) if not os.path.lexists(d)]  # deepest first
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _move_into_library(staged, dest)
+    except BaseException as exc:
+        for d in new_dirs:  # only directories this call created, and only while empty
+            try:
+                d.rmdir()
+            except OSError:
+                break
+        if isinstance(exc, FileExistsError) and (taken := _taken(conn, library, item, rel, staged)):
+            return taken  # the path was taken after the check above: the staged copy stays, and the conflict names it
+        raise
+    try:
+        received = _insert_file(conn, item, rel, dest, facts, quality, source)
+        log_event(conn, "fetch.placed", rel, f"Placed '{item.title}' by {item.artist} as {received or facts['codec']}"
+                  + ("" if source == "tidal" else f" via {source}"),
+                  {"tidal_track_id": tidal_id, "recording_id": item.recording_id, "path": rel,
+                   "quality_requested": quality, "quality_received": received, "audio_quality": audio_quality,
+                   **extra, "source": source})
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise FetchError(f"placed {rel} but the ledger insert failed ({exc}); import-legacy will pick it up") from exc
+    try:  # only after the commit; a same-filesystem placement already unlinked the source, a cross-device one did not
+        staged.unlink(missing_ok=True)  # already gone after a same-filesystem link
+    except OSError as exc:
+        log_event(conn, "fetch.staged_cleanup_failed", rel, f"Placed '{item.title}' by {item.artist} and recorded it, "
+                  f"but could not remove the staged copy {staged} ({_safe_message(exc)}); remove it by hand",
+                  {"path": rel, "staged": str(staged)})
+        conn.commit()
+    held = _staged(staging, item, rel, ".m4a")  # only this exact staged sibling, never a library file
+    if os.path.lexists(held):
+        try:
+            held.unlink()
+            log_event(conn, "fetch.stale_held_removed", rel, f"Removed the lossy staged copy of '{item.title}' by "
+                      f"{item.artist} because a FLAC was placed", {"path": rel, "staged": str(held)})
+        except Exception as exc:  # the placement stands either way
+            log_event(conn, "fetch.stale_held_remove_failed", rel, f"Could not remove the lossy staged copy {held}: "
+                      f"{_safe_message(exc)}", {"path": rel, "staged": str(held)})
+        conn.commit()
+    return "placed", note
+
+
+def _isrc(code: str) -> str:
+    return re.sub(r"[\s-]", "", code).upper()
+
+
+def _accept(item: FetchItem, name: str, acq: Acquired, staging: Path, frel: str, ffmpeg: str | None) -> tuple[Path, dict]:
+    """Vet what a fallback produced: a FLAC mutagen can open, whose ISRC tag (if it has one and the plan has one)
+    agrees, that decodes and has the planned length. Verification is mandatory here, whatever `verify` says. The file is
+    copied to staging (never moved) before it is tagged. Returns (staged path, file facts) or raises FallbackMiss/FetchError."""
+    if acq.path.suffix.lower() != ".flac":
+        raise FallbackMiss("not FLAC")
+    try:
+        found = (mutagen.flac.FLAC(acq.path).get("isrc") or [""])[0].strip()  # read before _tag overwrites it
+    except Exception:
+        raise FallbackMiss("not FLAC") from None
+    if found and item.isrc and _isrc(found) != _isrc(item.isrc):
+        raise FallbackMiss(f"ISRC mismatch (file {found}, planned {item.isrc})")
+    if not ffmpeg:
+        raise FallbackMiss("ffmpeg not found: fallback files are always verified")
+    p = Path(frel)
+    staged = staging / p.with_name(f"{p.stem} [{name}].flac")
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    part = staged.with_name(staged.name + ".part")
+    try:
+        shutil.copy2(acq.path, part)
+        _verify(part, ffmpeg, item.duration_s)
+    except BaseException:
+        part.unlink(missing_ok=True)  # only our own .part, never the source
+        raise
+    os.replace(part, staged)
+    try:
+        _tag(staged, item)
+        facts = _file_facts(staged, _NO_STREAM)
+        if quality_facts.facts(facts["codec"], facts["sample_rate"], facts["bit_depth"], facts["bitrate"])[0]:
+            raise FallbackMiss("not lossless")
+    except BaseException:
+        staged.unlink(missing_ok=True)  # Cadence's own staged copy of the fallback file; the source is never touched
+        raise
+    return staged, facts
+
+
+def _try_one(conn, gate: Gate, item: FetchItem, fb, staging: Path, library: Path, quality: str, ffmpeg: str | None,
+             frel: str) -> tuple[str, str] | None:
+    """One fallback: None on a miss (logged and committed), else the `_place` result. GatePaused and AuthStop pass up."""
+    root = staging / ".fallback"
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(dir=root, prefix=f"{fb.name}-{item.tidal_track_id}-"))
+    try:
+        acq = fb.acquire(item, workdir, gate)
+        staged, facts = _accept(item, fb.name, acq, staging, frel, ffmpeg)
+    except (GatePaused, AuthStop):
+        raise
+    except VpnDown as exc:  # this source is off for the rest of the run (_try_fallbacks skips it from now on)
+        fb.disabled = reason = str(exc)
+        log_event(conn, "fetch.vpn_down", frel, f"{fb.name} stopped for this run: {reason}",
+                  {"source": fb.name, "reason": reason, "tidal_track_id": item.tidal_track_id, "path": frel})
+        conn.commit()
+        return None
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, (FallbackMiss, FetchError)) else f"{type(exc).__name__}: {_safe_message(exc)}"
+        log_event(conn, "fetch.fallback_miss", frel, f"{fb.name} had nothing usable for '{item.title}' by {item.artist}: "
+                  f"{reason}", {"source": fb.name, "reason": reason, "tidal_track_id": item.tidal_track_id,
+                                "recording_id": item.recording_id, "path": frel})
+        conn.commit()
+        return None
+    finally:  # Cadence made the workdir; an Orpheus one holds only its output, a Soulseek one is empty
+        if getattr(fb, "owns_workdir", False):
+            shutil.rmtree(workdir, ignore_errors=True)
+        else:
+            try:
+                workdir.rmdir()
+            except OSError:
+                pass
+    return _place(conn, library, staging, item, frel, staged, facts, quality, item.tidal_track_id, None,
+                  {"fallback_ref": acq.ref, "planned_tidal_track_id": item.tidal_track_id, **acq.detail}, fb.name,
+                  f"{VIA}{fb.name} ({acq.ref})")
+
+
+def _try_fallbacks(conn, gate: Gate, item: FetchItem, fallbacks: list, staging: Path, library: Path, quality: str,
+                   ffmpeg: str | None) -> tuple[tuple[str, str] | None, list[str]]:
+    """Where Tidal served only lossy, ask each fallback in order for a lossless copy of the same recording. Returns
+    (result, names tried): the `_place` result of the first that works (or a conflict/exists from the target check),
+    else None and the caller holds the lossy copy as before. Without a planned duration nothing is called: sources are
+    matched by search and the length is the anchor."""
+    frel = item.target(".flac")
+    if item.duration_s is None:
+        log_event(conn, "fetch.fallback_skipped", frel, f"No fallback tried for '{item.title}' by {item.artist}: its "
+                  "duration is unknown, so a search result cannot be checked", {"tidal_track_id": item.tidal_track_id,
+                                                                               "path": frel, "reason": "duration unknown"})
+        conn.commit()
+        return None, []
+    if taken := _taken(conn, library, item, frel):
+        return taken, []
+    tried: list[str] = []
+    for fb in fallbacks:
+        if getattr(fb, "disabled", None):
+            continue
+        tried.append(fb.name)
+        if done := _try_one(conn, gate, item, fb, staging, library, quality, ffmpeg, frel):
+            return done, tried
+    return None, tried
+
+
 def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, library: Path, quality: str,
-               verify: bool, ffmpeg: str | None) -> tuple[str, str]:
+               verify: bool, ffmpeg: str | None, fallbacks: list = ()) -> tuple[str, str]:
     """(status, note): status is 'placed', 'exists', 'conflict' (the target is taken by a file that is not this track's)
-    or 'held_lossy' (a lossy file stays in staging unless HIGH was requested). Raises GatePaused, AuthStop, Blocked, FetchError or StreamRefused."""
+    or 'held_lossy' (a lossy file stays in staging unless HIGH was requested; `fallbacks` are tried first). Raises GatePaused, AuthStop, Blocked, FetchError or StreamRefused."""
     rel = item.target_rel
     if not _safe_rel(rel):
         raise FetchError(f"unsafe target path '{rel}'")
@@ -402,6 +565,8 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
             src = replace(item, tidal_track_id=alt[0], duration_s=alt[1] if item.duration_s is None else item.duration_s)
             stream = alt[2]
         elif already_held:  # no other edition is lossless: the held copy stays as it is
+            if fallbacks and (done := _try_fallbacks(conn, gate, item, fallbacks, staging, library, quality, ffmpeg)[0]):
+                return done
             return "held_lossy", f"already held in staging, not fetched again: {held}"
     if stream.ext != Path(rel).suffix:
         rel = item.target(stream.ext)
@@ -425,60 +590,21 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
     facts = _file_facts(staged, stream)
     lossy, received = quality_facts.facts(facts["codec"], facts["sample_rate"], facts["bit_depth"], facts["bitrate"])
     # lossless-only placement: keep it in staging, no library file, no file row
-    if lossy and quality in ("LOSSLESS", "HI_RES_LOSSLESS"):
+    if lossy and quality in LOSSLESS:
+        done, ftried = _try_fallbacks(conn, gate, item, fallbacks, staging, library, quality, ffmpeg) if fallbacks else (None, [])
+        if done:
+            return done  # a FLAC was placed (or its target is taken); the existing tail removes the held .m4a
         note = f"{staged} ({received or facts['codec']})"
         log_event(conn, "fetch.held_lossy", rel, f"Held '{item.title}' by {item.artist} in staging: got lossy "
                   f"{received or facts['codec']} but {quality} was requested", {
                       "tidal_track_id": item.tidal_track_id, "recording_id": item.recording_id, "path": rel,
                       "staged": str(staged), "quality_requested": quality, "quality_received": received,
-                      "audio_quality": stream.audio_quality, "alternates_tried": tried})
+                      "audio_quality": stream.audio_quality, "alternates_tried": tried,
+                      **({"fallbacks_tried": ftried} if ftried else {})})
         conn.commit()
         return "held_lossy", note
-    dest = library / rel
-    if taken := _taken(conn, library, item, rel, staged):
-        return taken
-    new_dirs = [d for d in (dest.parent, *dest.parent.parents) if not os.path.lexists(d)]  # deepest first
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        _move_into_library(staged, dest)
-    except BaseException as exc:
-        for d in new_dirs:  # only directories this call created, and only while empty
-            try:
-                d.rmdir()
-            except OSError:
-                break
-        if isinstance(exc, FileExistsError) and (taken := _taken(conn, library, item, rel, staged)):
-            return taken  # the path was taken after the check above: the staged copy stays, and the conflict names it
-        raise
-    try:
-        received = _insert_file(conn, item, rel, dest, facts, quality)
-        log_event(conn, "fetch.placed", rel, f"Placed '{item.title}' by {item.artist} as {received or facts['codec']}",
-                  {"tidal_track_id": src.tidal_track_id, "recording_id": item.recording_id, "path": rel,
-                   "quality_requested": quality, "quality_received": received,
-                   "audio_quality": stream.audio_quality,
-                   **({"planned_tidal_track_id": item.tidal_track_id} if src is not item else {})})
-        conn.commit()
-    except sqlite3.Error as exc:
-        conn.rollback()
-        raise FetchError(f"placed {rel} but the ledger insert failed ({exc}); import-legacy will pick it up") from exc
-    try:  # only after the commit; a same-filesystem placement already unlinked the source, a cross-device one did not
-        staged.unlink(missing_ok=True)  # already gone after a same-filesystem link
-    except OSError as exc:
-        log_event(conn, "fetch.staged_cleanup_failed", rel, f"Placed '{item.title}' by {item.artist} and recorded it, "
-                  f"but could not remove the staged copy {staged} ({_safe_message(exc)}); remove it by hand",
-                  {"path": rel, "staged": str(staged)})
-        conn.commit()
-    held = _staged(staging, item, rel, ".m4a")  # only this exact staged sibling, never a library file
-    if os.path.lexists(held):
-        try:
-            held.unlink()
-            log_event(conn, "fetch.stale_held_removed", rel, f"Removed the lossy staged copy of '{item.title}' by "
-                      f"{item.artist} because a FLAC was placed", {"path": rel, "staged": str(held)})
-        except Exception as exc:  # the placement stands either way
-            log_event(conn, "fetch.stale_held_remove_failed", rel, f"Could not remove the lossy staged copy {held}: "
-                      f"{_safe_message(exc)}", {"path": rel, "staged": str(held)})
-        conn.commit()
-    return "placed", ""
+    return _place(conn, library, staging, item, rel, staged, facts, quality, src.tidal_track_id, stream.audio_quality,
+                  {"planned_tidal_track_id": item.tidal_track_id} if src is not item else {})
 
 
 # ---- the run ----
@@ -528,9 +654,12 @@ def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out
 
 def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: list[FetchItem], staging_dir,
                 library_root, dry_run: bool = True, quality: str = DEFAULT_QUALITY, verify: bool = True, *,
-                http=None, ffmpeg: str | None = None, out=print, plan: Plan | None = None) -> dict:
+                http=None, ffmpeg: str | None = None, out=print, plan: Plan | None = None,
+                fallbacks: list | None = None) -> dict:
     """Result keys: placed, exists, conflict, held_lossy, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
-    setup), until, remaining (items not attempted, including the one a stop happened on)."""
+    setup), until, remaining (items not attempted, including the one a stop happened on). `fallbacks` (fallback.py) are
+    tried, in order, for tracks Tidal serves lossy under a lossless request; when any are given the result also has
+    via_fallback (placed items whose file came from one), and their check() runs once in the preflight."""
     library_root = Path(library_root)
     if dry_run:  # `plan` is the planner's result: its skipped tracks and counts are printed with the items
         return _dry_run(conn, items, library_root, quality, out, plan)
@@ -538,7 +667,24 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
     res = {"dry_run": False, "placed": 0, "exists": 0, "conflict": 0, "held_lossy": 0, "blocked": 0, "failed": 0,
            "skipped_dest": 0, "stopped": None, "until": None, "remaining": []}
-    problem = _preflight(staging_dir, library_root, verify, ffmpeg)
+    active = list(fallbacks or []) if quality in LOSSLESS else []  # HIGH never calls a fallback
+    if fallbacks:
+        res.update(via_fallback=0, vpn_down=0)
+    problem = _preflight(staging_dir, library_root, verify or bool(active), ffmpeg)  # fallback files are always verified
+    for fb in active if not problem else ():
+        if found := fb.check():
+            problem = f"fallback {fb.name}: {found}"
+            break
+        if reason := getattr(fb, "disabled", None):  # its VPN is down: only this source is off, the run goes on
+            out(f"fallback {fb.name}: off for this run ({reason})")
+            log_event(conn, "fetch.vpn_down", fb.name, f"{fb.name} stopped for this run: {reason}",
+                      {"source": fb.name, "reason": reason, "stage": "preflight"})
+            conn.commit()
+        elif ip := getattr(fb, "public_ip", None):  # the VPN's exit address is fine to show; the keys never are
+            out(f"fallback {fb.name}: VPN running, public IP {ip}")
+            log_event(conn, "fetch.vpn_up", fb.name, f"{fb.name} VPN is running, public IP {ip}",
+                      {"source": fb.name, "public_ip": ip})
+            conn.commit()
     if problem:
         _report_plan(plan, items, out)  # the plan is already built: say what it decided before the setup error
         out(f"fetch: {problem}")
@@ -555,8 +701,11 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
             out(f"  skip (fiio-only, not handled yet) {it.target_rel}")
             continue
         try:
-            status, note = _fetch_one(conn, session, gate, http, it, staging_dir, library_root, quality, verify, ffmpeg)
+            status, note = _fetch_one(conn, session, gate, http, it, staging_dir, library_root, quality, verify, ffmpeg,
+                                      active)
             res[status] += 1
+            if status == "placed" and note.startswith(VIA):
+                res["via_fallback"] += 1
             out(f"  {status:<10} {it.target_rel}" + (f"  ({note})" if note else ""))
             network_failures = 0
         except GatePaused as p:
@@ -593,9 +742,11 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
             if network_failures >= MAX_NETWORK_FAILURES:
                 res.update(stopped="network", remaining=list(items[i + 1:]))
                 break
+    if fallbacks:
+        res["vpn_down"] = sum(1 for fb in active if getattr(fb, "disabled", None))
     _report_plan(plan, items, out)
     out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['conflict']} conflict, "
-        f"{res['held_lossy']} held (lossy), "
+        f"{res['held_lossy']} held (lossy), " + (f"{res['via_fallback']} via fallback, {res['vpn_down']} vpn down, " if fallbacks else "") +
         f"{res['blocked']} blocked, "
         f"{res['failed']} failed, {res['skipped_dest']} fiio-skipped, {len(res['remaining'])} not attempted, "
         f"stopped={res['stopped']}")
