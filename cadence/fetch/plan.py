@@ -1,40 +1,54 @@
 """What to fetch: one item per unowned recording cluster, using the canonical recording's Tidal track.
 
-Read-only over the ledger. A cluster is owned when any file is linked to a recording in it (library-wide), the
-same rule report.py uses. The canonical recording is `COALESCE(canon_id, id)`, which `cadence regroup` sets
-with the latest-remaster rule (identity/grouping.py).
+Reads the ledger only. A cluster (`COALESCE(canon_id, id)`, set by `cadence regroup` with the latest-remaster rule,
+identity/grouping.py) is owned when at least one `file` row has `recording_id` set to a recording in it, library-wide.
+Nothing else counts: `cadence link` is the only identity resolver, so a file it did not link (including one it put
+in `link_review` as ambiguous) owns nothing here. The planner never matches files by tags, names, durations or
+folders. The policy is duplicate-or-conflict: a track with only an unlinked file is planned, and if its target path is
+taken the executor (run.py) reports `conflict`; the planner does not look at the disk. The one path check it makes is
+on the ledger: a planned target equal to the path of a file linked to another recording stays planned and is listed
+in `Plan.collisions`, so the plan says up front what the executor will report as a conflict. Never skipped, never overwritten.
 
-Scope (default 'partial'): only release groups where something is already owned (a linked cluster, or a folder
-in the library that carries the group's name). Folder naming: an existing library folder of the same release
-group is reused as is; otherwise the album title without remaster/edition markers is used. Near-duplicates of
-files the user already has (same release group, similar title, duration within 3 s) are skipped and reported.
-A linked file is a near-duplicate only of a related but different title, never of the identical one."""
+Every recording cluster of the artist ends up in exactly one bucket of the returned `Plan`: owned (counted), planned
+(`items`) or skipped with a reason (`skipped`); none disappears silently. A cluster is counted once however many
+editions carry it, but `owned` is counted per artist that carries the cluster, not per cluster. One shared by several artists is planned under one only (the recording row's artist, else the first);
+the others skip it with R_SHARED.
+
+Scope (default 'partial'): only release groups where something is already owned. The album folder is the release
+title without remaster/edition markers."""
 from __future__ import annotations
 
-import re
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass, replace
-from typing import NamedTuple
+from dataclasses import dataclass, field, replace
 
-from cadence.identity.normalize import _GROUP_RE, _classify, _peel_suffixes, norm_title, split_title
+from cadence.identity.normalize import _GROUP_RE, _classify, _peel_suffixes
 from cadence.ledger import naming
 
 _TYPE_RANK = {"album": 0, "ep": 1, "single": 2, "compilation": 3, "other": 4}
 _NO_DATE = "9999-99-99"
 _MARKERS = {"remaster", "deluxe", "edition"}
-SAME_DURATION_S = 3
-_NUMBERED_NAME = re.compile(r"^\s*(\d+)\s*-\s*(.+)$")  # 'NN - Title' (extension already removed)
 
-_REL_FILTER = "rel.artist_id = ?1 AND ((rel.role = 'own' AND rel.hidden_reason IS NULL) OR rel.id = ?2)"
-_ALL_TRACKS = (
-    "SELECT t.tidal_id AS tidal_track_id, t.disc, t.number, t.title, t.version, t.duration_s AS t_dur, "
+# why a recording cluster was not planned (printed next to the track and counted in the summary)
+R_PARTIAL = "partial scope: release has no owned track"
+R_VARIANT = "variant (use --include-variants)"
+R_UNAVAILABLE = "unavailable on Tidal"
+R_NO_TIDAL_ID = "no tidal id"
+R_HIDDEN = "hidden release"
+R_APPEARS_ON = "appears-on release (name it with --release)"
+R_NOT_IN_RELEASE = "release not in --release"
+R_ARTIST_UNMATCHED = "artist not matched to Tidal (set it with cadence artist set-tidal)"
+R_SHARED = "shared recording, planned under"  # followed by the artist's name
+
+# every track of the artist, whatever its release's role or visibility: the classification happens in Python
+_ROWS = (
+    "SELECT t.tidal_id AS tidal_track_id, t.available, t.disc, t.number, t.title, t.version, t.duration_s AS t_dur, "
     "rec.id AS rec_id, COALESCE(rec.canon_id, rec.id) AS cid, rec.variant, rec.isrc, rec.duration_s AS r_dur, "
-    "rel.id AS release_id, rel.title AS release_title, rel.type, rel.release_date, "
+    "rel.id AS release_id, rel.title AS release_title, rel.type, rel.release_date, rel.role, rel.hidden_reason, "
+    "COALESCE(rel.group_key, 'release:' || rel.id) AS gk, "
     "(SELECT s.provider_ref FROM release_source s WHERE s.release_id = rel.id AND s.provider = 'tidal') AS tidal_release "
     "FROM track t JOIN release rel ON rel.id = t.release_id JOIN recording rec ON rec.id = t.recording_id "
-    f"WHERE {_REL_FILTER}")
-_TRACKS = _ALL_TRACKS + " AND t.tidal_id IS NOT NULL AND t.available IS NOT 0"
+    "WHERE rel.artist_id = ?")
 
 
 @dataclass(frozen=True)
@@ -61,25 +75,61 @@ class FetchItem:
         return f"{self.album_dir}/{naming.track_file(self.number, self.title, ext, self.disc, self.discs)}"
 
 
-class _Track(NamedTuple):
+@dataclass(frozen=True)
+class Skip:
+    """A recording cluster that was not planned, shown as one of its tracks (the one that would have been chosen)."""
+    artist: str
+    release: str
     disc: int
     number: int
-    title: str                 # norm_title of title plus version
-    duration_s: int | None
-    multi_disc: bool
-    cid: int
-    exact: str                 # what the legacy rule compares: `title`, or the raw title when that normalises to nothing
+    title: str
+    tidal_track_id: int | None
+    recording_id: int
+    reason: str
+
+    def line(self) -> str:
+        pos = (f"D{self.disc}-" if self.disc != 1 else "") + f"{self.number:02d}"
+        tid = self.tidal_track_id if self.tidal_track_id is not None else "-"
+        return f"  {'skip':<16} {self.artist} / {self.release} / {pos} - {self.title}  [tidal {tid}]  ({self.reason})"
 
 
-def _exact(title: str, version: str | None = None) -> str:
-    """norm_title, or for a title that is only symbols ('?') the lowercased raw title, so it still matches itself."""
-    return norm_title(title, version) or title.strip().lower()
+@dataclass(frozen=True)
+class Collision:
+    """A planned item whose target path is already spoken for. `kind` says by what:
+    'linked': the path of a file the ledger links to a different recording (`file_path` is that file's path);
+    'duplicate': the target of an earlier planned item of another recording (`file_path` is that item's target, and
+    `tidal_track_id` is the later item's: the one the executor reports as a conflict, and the dry run too). Paths
+    compare case-insensitively in both kinds. In both kinds `file_path` equals `target`."""
+    tidal_track_id: int
+    target: str
+    file_path: str
+    kind: str = "linked"       # 'linked' | 'duplicate'
+
+    def line(self, fiio: bool = False) -> str:
+        what = ("duplicate target, another planned track has the same path" if self.kind == "duplicate"
+                else "file already linked to another recording")
+        return (f"  collision  {self.target}  planned tidal {self.tidal_track_id}, {what}  "
+                + ("(fiio-only, checked in dry run and at execute)" if fiio else "(may conflict at execute)"))
 
 
-def _track(r: sqlite3.Row, discs: dict) -> _Track:
-    return _Track(r["disc"], r["number"], norm_title(r["title"], r["version"]),
-                  r["t_dur"] if r["t_dur"] is not None else r["r_dur"], discs.get(r["release_id"], 1) > 1, r["cid"],
-                  _exact(r["title"], r["version"]))
+@dataclass
+class Plan:
+    """Where every recording cluster of the planned artists went: `items` (to fetch), `owned` (a linked file exists;
+    only counted), `skipped` (each with a reason). planned + owned + skipped covers each cluster exactly once.
+    `collisions` annotates items (they stay in `items`), sorted by target, Tidal id, kind."""
+    items: list[FetchItem] = field(default_factory=list)
+    owned: int = 0
+    skipped: list[Skip] = field(default_factory=list)
+    collisions: list[Collision] = field(default_factory=list)
+
+    def skip_counts(self) -> list[tuple[str, int]]:
+        return sorted(Counter(s.reason for s in self.skipped).items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def summary_lines(self) -> list[str]:
+        n = len({c.tidal_track_id for c in self.collisions})  # an item with two collisions counts once
+        return [f"plan: {len(self.items)} planned, {self.owned} owned, {len(self.skipped)} skipped"
+                + (f", {n} collision{'s' * (n != 1)}" if n else ""),
+                *(f"  {n:>6} skipped: {reason}" for reason, n in self.skip_counts())]
 
 
 # ---- names ----
@@ -103,17 +153,6 @@ def display_title(title: str, version: str | None) -> str:
     return strip_markers(full)
 
 
-def _name_key(title: str, version: str | None = None) -> str:
-    """Folded release name without edition markers: what a release group is called, and what a folder matches."""
-    p = split_title(title, version, release=True)
-    return p.base + (f" [{p.variant}]" if p.variant else "")
-
-
-def _related(a: str, b: str) -> bool:
-    """Equal normalised titles, or one is the other plus extra whole words ('hitchhiker' / 'hitchhiker like an inca 1')."""
-    return bool(a and b) and (a == b or a.startswith(b + " ") or b.startswith(a + " "))
-
-
 # ---- ledger views ----
 
 def _owned_clusters(conn: sqlite3.Connection) -> set[int]:
@@ -133,107 +172,22 @@ def _pick(rows: list) -> sqlite3.Row:
                                     r["release_date"] or _NO_DATE, r["release_id"], r["disc"], r["number"]))
 
 
-def _candidates(rows: list, own: dict) -> list:
-    """Rows `_pick` chooses from: the non-variant ones (all rows if there are none), own-release rows first."""
+def _preferred_rows(rows: list) -> list:
+    """Rows `_pick` chooses from: the non-variant ones (all rows if there are none), own-visible-release rows first."""
     rows = [r for r in rows if r["variant"] is None] or rows
-    return [r for r in rows if r["release_id"] in own] or rows
+    return [r for r in rows if _own_visible(r)] or rows
 
 
-def _title_and_number(path: str, tag_title: str | None, tag_track: str | None) -> tuple[set[str], set[int]]:
-    """Normalised titles (raw ones for symbol-only titles) and track numbers a file claims, from its tags and from an `NN - Title` file name."""
-    name = _NUMBERED_NAME.match(path.rsplit("/", 1)[-1].rsplit(".", 1)[0])
-    tag_no = re.match(r"\s*(\d+)", tag_track or "")
-    titles = {_exact(t) for t in (tag_title, name and name.group(2)) if t}
-    numbers = {int(m.group(1)) for m in (name, tag_no) if m}
-    return titles, numbers
-
-
-class _Library:
-    """What the artist's files say about each release group: their folders and their (title, duration)."""
-
-    def __init__(self, conn: sqlite3.Connection, artist_id: int, release_id: int | None):
-        rels = conn.execute(f"SELECT rel.id, rel.title, rel.version, COALESCE(rel.group_key, 'release:' || rel.id) AS gk "
-                            f"FROM release rel WHERE {_REL_FILTER}", (artist_id, release_id)).fetchall()
-        self.group_of = {r["id"]: r["gk"] for r in rels}
-        name_to_groups: dict[str, set[str]] = {}
-        for r in rels:
-            name_to_groups.setdefault(_name_key(r["title"], r["version"]), set()).add(r["gk"])
-        rec_groups: dict[int, set[str]] = {}
-        for t in conn.execute(f"SELECT t.recording_id AS rid, rel.id AS relid FROM track t JOIN release rel "
-                              f"ON rel.id = t.release_id WHERE {_REL_FILTER}", (artist_id, release_id)):
-            rec_groups.setdefault(t["rid"], set()).add(self.group_of[t["relid"]])
-        self.dirs: dict[str, Counter] = {}
-        self.files: dict[str, list[tuple[str, float, str, int | None]]] = {}  # (title, duration, path, cluster)
-        self.unlinked: dict[str, list[tuple[set[str], set[int], str]]] = {}  # (titles, track numbers, path)
-        for f in conn.execute("SELECT f.path, f.recording_id, f.tag_title, f.tag_track, f.duration_s, "
-                              "COALESCE(rec.canon_id, rec.id) AS cid FROM file f "
-                              "LEFT JOIN recording rec ON rec.id = f.recording_id WHERE f.artist_id = ?", (artist_id,)):
-            if "/" not in f["path"]:
-                continue
-            folder = f["path"].rsplit("/", 1)[0]
-            key = _name_key(folder.rsplit("/", 1)[-1])
-            # a folder named like a known group belongs to that group; an oddly named one to the groups it is linked to
-            groups = name_to_groups.get(key) or rec_groups.get(f["recording_id"], set())
-            for g in groups:
-                self.dirs.setdefault(g, Counter())[folder] += 1
-                if f["tag_title"] and f["duration_s"] is not None:
-                    self.files.setdefault(g, []).append((norm_title(f["tag_title"]), f["duration_s"], f["path"], f["cid"]))
-                if f["recording_id"] is None:
-                    titles, numbers = _title_and_number(f["path"], f["tag_title"], f["tag_track"])
-                    self.unlinked.setdefault(g, []).append((titles, numbers, f["path"]))
-
-    def folder(self, group: str) -> str | None:
-        votes = self.dirs.get(group)
-        return max(sorted(votes), key=votes.__getitem__) if votes else None
-
-    def fits(self, group: str, t: _Track) -> list[str]:
-        """Paths of the group's files that could be track `t`, by duration or by the legacy rule. A file linked to
-        t's own cluster is its owner, not a match, and a linked file with the identical title is another track of the
-        same name (an owned `Intro` does not stand in for an unowned `Intro`), so only unlinked files match on that."""
-        paths = []
-        if t.duration_s is not None:
-            paths += [p for nt, dur, p, cid in self.files.get(group, ())
-                      if cid != t.cid and abs(dur - t.duration_s) <= SAME_DURATION_S and _related(nt, t.title)
-                      and (cid is None or nt != t.title)]
-        if t.multi_disc:
-            # Legacy files on a multi-disc album are named `NN - Title` with no disc prefix, and their length can
-            # differ from Tidal's by more than the tolerance (other master), so the duration rule misses them and
-            # the track would be fetched again as `D1-NN - Title`. The same title (exactly: a live or other variant
-            # is another recording) and the same track number is enough here. Only unlinked files count: a linked one
-            # already owns its own track (disc 2 may repeat title and number).
-            paths += [p for titles, numbers, p in self.unlinked.get(group, ()) if t.number in numbers and t.exact and t.exact in titles]
-        return list(dict.fromkeys(paths))
-
-    def fits_in(self, groups: set[str], t: _Track) -> list[str]:
-        """`fits` over every group the cluster has a track in: a file sits in each group its folder name matches."""
-        return list(dict.fromkeys(p for g in sorted(groups) for p in self.fits(g, t)))
-
-    def claims(self, groups: set[str], ts: list[_Track]) -> list[str]:
-        """Paths of the files that fit any of one cluster's tracks `ts`, available or not."""
-        return list(dict.fromkeys(p for t in ts for p in self.fits_in(groups, t)))
-
-    def candidates(self, tracks: dict[int, list[_Track]], groups: dict[int, set[str]]) -> dict[str, set[int]]:
-        """For each file, the clusters it could be (through any of their tracks), whatever release group they are in."""
-        out: dict[str, set[int]] = {}
-        for cid, ts in tracks.items():
-            for p in self.claims(groups[cid], ts):
-                out.setdefault(p, set()).add(cid)
-        return out
-
-    def owned_under_another_title(self, groups: set[str], ts: list[_Track], cands: dict[str, set[int]]) -> str | None:
-        """The file that is the cluster of `ts` under another name. A file that could be another cluster too cannot
-        tell which one it is, so it claims none."""
-        return next((p for p in self.claims(groups, ts) if cands.get(p, set()) <= {ts[0].cid}), None)
+def _own_visible(r) -> bool:
+    return r["role"] == "own" and r["hidden_reason"] is None
 
 
 def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release_id: int | None = None,
-                 include_variants: bool = False, ext: str = ".flac", scope: str = "partial",
-                 skipped: list | None = None) -> list[FetchItem]:
-    """Ledger ids in, items out. `release_id` limits the plan to the clusters on that release (an explicit request,
+                 include_variants: bool = False, ext: str = ".flac", scope: str = "partial") -> Plan:
+    """Ledger ids in, a `Plan` out. `release_id` limits the plan to the clusters on that release (an explicit request,
     so `scope` does not apply; the chosen track may still sit on another edition). Only artists with tidal_match
-    auto/manual are planned. Near-duplicates of owned files are left out and appended to `skipped` as
-    (FetchItem, owned path) when a list is given. What a file claims is worked out over the artist's own releases
-    only, whatever `release_id` or `scope` say: they choose what is planned, never what is owned."""
+    auto/manual are planned; the clusters of any other artist are owned or skipped (R_ARTIST_UNMATCHED).
+    Ownership is the ledger's links and nothing else (see the module docstring)."""
     if scope not in ("partial", "all"):
         raise ValueError("scope must be 'partial' or 'all'")
     owned = _owned_clusters(conn)
@@ -241,68 +195,96 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
     if release_id is not None:
         rel = conn.execute("SELECT artist_id FROM release WHERE id = ?", (release_id,)).fetchone()
         if rel is None:
-            return []
+            return Plan()
         artist_id = rel["artist_id"]
         only = {r[0] for r in conn.execute(
             "SELECT DISTINCT COALESCE(rec.canon_id, rec.id) FROM track t JOIN recording rec "
             "ON rec.id = t.recording_id WHERE t.release_id = ?", (release_id,))}
-    artists = conn.execute("SELECT * FROM artist WHERE tidal_match IN ('auto', 'manual') AND tidal_id IS NOT NULL "
-                           "AND (?1 IS NULL OR id = ?1) ORDER BY norm_name", (artist_id,)).fetchall()
-    items: list[FetchItem] = []
+    artists = conn.execute("SELECT * FROM artist WHERE (?1 IS NULL OR id = ?1) ORDER BY norm_name", (artist_id,)).fetchall()
+    plan = Plan()
+    claims: dict[int, list[FetchItem]] = {}  # cluster -> the items that would plan it, one per artist, in plan order
+
+    def visible(r) -> bool:  # a row of an own, unhidden release, or of the release asked for
+        return _own_visible(r) or r["release_id"] == release_id
+
     for a in artists:
-        lib = _Library(conn, a["id"], release_id)
-        claim_lib = _Library(conn, a["id"], None) if release_id is not None else lib  # not widened by the request
-        rows = [r for r in conn.execute(_TRACKS, (a["id"], release_id))]
         discs = {r[0]: r[1] for r in conn.execute(  # Tidal's volume count (else 1) or the top disc of any row
             "SELECT rel.id, MAX(CASE WHEN rel.num_volumes >= 1 THEN rel.num_volumes ELSE 1 END, "
             "COALESCE((SELECT MAX(t.disc) FROM track t WHERE t.release_id = rel.id), 1)) "
             "FROM release rel WHERE rel.artist_id = ?", (a["id"],))}
-        by_cluster: dict[int, list] = {}  # every non-variant track of each cluster, owned or not, in scope or not
-        cluster_groups: dict[int, set[str]] = {}
-        for r in conn.execute(_ALL_TRACKS, (a["id"], None)):
-            cluster_groups.setdefault(r["cid"], set()).add(claim_lib.group_of[r["release_id"]])
-            if r["variant"] is None:
-                by_cluster.setdefault(r["cid"], []).append(r)
-        # every track of a cluster can claim a file, the representative (chosen over all its rows) first
-        tracks = {cid: [_track(_pick(rs), discs), *(_track(r, discs) for r in rs)] for cid, rs in by_cluster.items()}
-        cands = claim_lib.candidates(tracks, cluster_groups)
-        in_group: dict[str, set[int]] = {}
+        rows = conn.execute(_ROWS, (a["id"],)).fetchall()
+
+        by_cluster: dict[int, list] = {}
         for r in rows:
-            in_group.setdefault(lib.group_of[r["release_id"]], set()).add(r["cid"])
-        partial = {g for g, cids in in_group.items() if cids & owned} | set(lib.dirs)
-        clusters: dict[int, list] = {}
-        for r in rows:
-            g = lib.group_of[r["release_id"]]
-            if r["cid"] in owned or (only is not None and r["cid"] not in only):
+            by_cluster.setdefault(r["cid"], []).append(r)
+        partial = {r["gk"] for r in rows if visible(r) and r["cid"] in owned}  # release groups with an owned track
+        picked: list[tuple] = []  # (row, FetchItem | Skip), sorted below by the row
+
+        def skip(rs: list, reason: str) -> None:
+            r = _pick(rs)
+            picked.append((r, Skip(a["name"], r["release_title"], r["disc"], r["number"],
+                                   display_title(r["title"], r["version"]), r["tidal_track_id"], r["rec_id"], reason)))
+
+        for cid, rs in by_cluster.items():
+            if cid in owned:
+                plan.owned += 1
                 continue
-            if only is None and scope == "partial" and g not in partial:
+            if a["tidal_match"] not in ("auto", "manual") or a["tidal_id"] is None:
+                skip(rs, R_ARTIST_UNMATCHED)
                 continue
-            clusters.setdefault(r["cid"], []).append(r)
-        # a row of one of the artist's own releases is preferred, so asking for an appears-on release (where the file
-        # may sit) does not move the target the default run would give
-        # and a non-variant row is preferred to any variant one, so a variant on an own release cannot hide it
-        picked = sorted((_pick(_candidates(rs, claim_lib.group_of)) for rs in clusters.values()),
-                        key=lambda r: (r["release_date"] or _NO_DATE, r["release_id"], r["disc"], r["number"]))
-        planned = [r for r in picked if r["variant"] is None or include_variants]
-        for r in planned:
-            g = lib.group_of[r["release_id"]]
-            folder = lib.folder(g)
-            album = folder.rsplit("/", 1)[-1] if folder else strip_markers(r["release_title"], release=True)
+            if only is not None and cid not in only:
+                skip(rs, R_NOT_IN_RELEASE)
+                continue
+            with_id = [r for r in rs if r["tidal_track_id"] is not None]
+            usable = [r for r in with_id if r["available"] != 0]
+            if not usable:
+                skip(with_id or rs, R_UNAVAILABLE if with_id else R_NO_TIDAL_ID)
+                continue
+            shown = [r for r in usable if visible(r)]
+            if not shown:
+                hidden = [r for r in usable if r["hidden_reason"] is not None]
+                skip(hidden or usable, R_HIDDEN if hidden else R_APPEARS_ON)
+                continue
+            if only is None and scope == "partial":
+                in_scope = [r for r in shown if r["gk"] in partial]
+                if not in_scope:
+                    skip(shown, R_PARTIAL)
+                    continue
+                shown = in_scope
+            r = _pick(_preferred_rows(shown))
+            if r["variant"] is not None and not include_variants:
+                skip([r], R_VARIANT)
+                continue
+            album = strip_markers(r["release_title"], release=True)
             item = FetchItem(
                 a["id"], a["name"], r["release_id"], int(r["tidal_release"]) if r["tidal_release"] else None,
-                album, folder or naming.album_dir(a["name"], album), r["disc"], r["number"],
+                album, naming.album_dir(a["name"], album), r["disc"], r["number"],
                 display_title(r["title"], r["version"]), r["tidal_track_id"], r["rec_id"],
                 r["t_dur"] if r["t_dur"] is not None else r["r_dur"], r["isrc"], r["variant"],
                 _dest(conn, a, r["release_id"]), "", discs.get(r["release_id"], 1))
-            item = replace(item, target_rel=item.target(ext))
-            ts = tracks.get(r["cid"]) or [_track(r, discs)]
-            if r["cid"] in cluster_groups:
-                twin = claim_lib.owned_under_another_title(cluster_groups[r["cid"]], ts, cands)
-            else:  # only on an appears-on release: no own group, so the file in that release's own folder claims it
-                twin = next((p for p in lib.claims({g}, ts) if not cands.get(p)), None)  # unless an own cluster claims it
-            if twin:
-                if skipped is not None:
-                    skipped.append((item, twin))
-                continue
-            items.append(item)
-    return items
+            picked.append((r, replace(item, target_rel=item.target(ext))))
+            claims.setdefault(cid, []).append(picked[-1][1])
+        picked.sort(key=lambda p: (p[0]["release_date"] or _NO_DATE, p[0]["release_id"], p[0]["disc"], p[0]["number"]))
+        for _, x in picked:
+            (plan.skipped if isinstance(x, Skip) else plan.items).append(x)
+    dropped: set[int] = set()  # a recording shared by artists is planned under one: the recording's, else the first
+    for cid, its in claims.items():
+        if len(its) > 1:
+            home = conn.execute("SELECT artist_id FROM recording WHERE id = ?", (cid,)).fetchone()[0]
+            keep = next((i for i in its if i.artist_id == home), its[0])
+            for i in its:
+                if i is not keep:
+                    dropped.add(id(i))
+                    plan.skipped.append(Skip(i.artist, i.release, i.disc, i.number, i.title, i.tidal_track_id,
+                                             i.recording_id, f"{R_SHARED} {keep.artist}"))
+    plan.items = [i for i in plan.items if id(i) not in dropped]
+    linked = {r[0].casefold() for r in conn.execute("SELECT path FROM file WHERE recording_id IS NOT NULL")}
+    first: dict[str, str] = {}  # casefolded target (the library is case-insensitive on macOS) -> the first item's
+    dups = []
+    for i in plan.items:  # items sharing a target: the first keeps it, each later one is listed
+        if (key := i.target_rel.casefold()) in first:
+            dups.append(Collision(i.tidal_track_id, first[key], first[key], "duplicate"))
+        first.setdefault(key, i.target_rel)
+    plan.collisions = sorted([*(Collision(i.tidal_track_id, i.target_rel, i.target_rel) for i in plan.items
+                                if i.target_rel.casefold() in linked), *dups], key=lambda c: (c.target, c.tidal_track_id, c.kind))
+    return plan

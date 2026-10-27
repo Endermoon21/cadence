@@ -406,7 +406,8 @@ def test_link_isrc_fuzzy_and_unmatched():
     add_file(conn, aid, "c.flac", "Other", 230)                 # too long -> never guess
     add_file(conn, None, "d.flac", "Song", 100)                  # no artist -> not considered
     stats = link_files(conn)
-    assert stats == {"files": 3, "isrc": 1, "fuzzy": 1, "unmatched": 1, "matched": 2}
+    assert stats == {"files": 3, "isrc": 1, "fuzzy": 1, "unmatched": 1, "ambiguous": 0, "no_longer_matches": 0,
+                     "matched": 2}
     a, b, c = (file_row(conn, p) for p in ("a.flac", "b.flac", "c.flac"))
     assert (a["match"], a["match_score"], b["match"], b["match_score"], c["match"]) == (
         "isrc", 1.0, "fuzzy", 0.9, "unmatched")
@@ -429,17 +430,22 @@ def test_manual_matches_are_never_overwritten():
     assert file_row(conn, "n.flac")["recording_id"] == rec
 
 
-def test_rematch_only_touches_non_manual_and_can_unlink():
+def test_rematch_only_touches_non_manual_and_keeps_a_link_that_stops_matching():
     conn, aid, cat = will_setup([rel(10, "Single", [WILL])], {10: [trk(100, "Song", 100, "ISRC1")]})
     sync_artist(conn, cat, row(conn, aid))
     add_file(conn, aid, "a.flac", "Song", 100)
     link_files(conn)
-    assert file_row(conn, "a.flac")["match"] == "fuzzy"
+    before = file_row(conn, "a.flac")
+    assert before["match"] == "fuzzy"
     assert link_files(conn)["files"] == 0                         # already matched: not re-evaluated
     conn.execute("UPDATE file SET duration_s = 300")              # the tag was fixed to something that no longer fits
-    assert link_files(conn, rematch=True)["unmatched"] == 1
-    f = file_row(conn, "a.flac")
-    assert (f["match"], f["recording_id"], f["match_score"]) == ("unmatched", None, None)
+    s = link_files(conn, rematch=True)
+    assert (s["no_longer_matches"], s["unmatched"]) == (1, 0)
+    f = file_row(conn, "a.flac")                                  # ownership is kept, and the review row says why
+    assert (f["match"], f["recording_id"], f["match_score"]) == (before["match"], before["recording_id"],
+                                                                 before["match_score"])
+    (r,) = conn.execute("SELECT reason FROM link_review").fetchall()
+    assert r["reason"] == "no_longer_matches"
 
 
 # ---------------------------------------------------------------- report

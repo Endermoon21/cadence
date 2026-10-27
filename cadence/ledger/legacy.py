@@ -69,6 +69,7 @@ def import_scan(conn: sqlite3.Connection, jsonl_path: str | Path) -> dict:
                 # a link to another artist's recording is stale now (manual links are never touched)
                 conn.execute("UPDATE file SET recording_id = NULL, match = 'unmatched', match_score = NULL "
                              "WHERE path = ?", (row["path"],))
+                conn.execute("DELETE FROM link_review WHERE file_id = (SELECT id FROM file WHERE path = ?)", (row["path"],))
             stats["files_updated" if existed else "files_new"] += 1
     conn.commit()
     return stats

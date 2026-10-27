@@ -19,7 +19,7 @@ import mutagen.mp4
 import requests
 
 from cadence.catalog.sync import _is_dead_connection, _named, _safe_message, _statuses
-from cadence.fetch.plan import FetchItem
+from cadence.fetch.plan import FetchItem, Plan
 from cadence.fetch.stream import StreamInfo, StreamRefused, ext_for_quality, resolve_stream
 from cadence.gate.bucket import Gate, GatePaused
 from cadence.ledger import quality as quality_facts
@@ -417,50 +417,74 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
 
 # ---- the run ----
 
-def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out, skipped) -> dict:
+def _report_plan(plan: Plan | None, items: list[FetchItem], out) -> None:
+    """The planner's skipped tracks (one line each, with reason and Tidal id), the collisions of the items about to be
+    attempted, and its planned/owned/skipped/collision counts."""
+    if plan is not None:
+        for s in plan.skipped:
+            out(s.line())
+        ids = {i.tidal_track_id for i in items}
+        fiio = {i.tidal_track_id for i in items if i.dest == "fiio"}
+        for c in plan.collisions:
+            if c.tidal_track_id in ids:
+                out(c.line(c.tidal_track_id in fiio))
+        for line in plan.summary_lines():
+            out(line)
+
+
+def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out, plan: Plan | None) -> dict:
     res = {"dry_run": True, "would_fetch": 0, "exists": 0, "conflict": 0, "skipped_dest": 0, "placed": 0, "held_lossy": 0,
-           "blocked": 0, "failed": 0, "owned_elsewhere": len(skipped), "stopped": None, "until": None, "remaining": []}
+           "blocked": 0, "failed": 0, "stopped": None, "until": None, "remaining": []}
     ext = ext_for_quality(quality)
     out(f"fetch (dry run, quality {quality}): {len(items)} item(s); nothing is downloaded or written. "
         "Re-run with --execute to fetch.")
+    later_dups = {c.tidal_track_id for c in plan.collisions if c.kind == "duplicate"} if plan else set()
+    fetching: set[str] = set()  # casefolded targets of the items above that would be fetched
     for it in items:
         rel = it.target(ext)
-        if it.dest == "fiio":
+        taken = _occupied(conn, library_root, it, rel)
+        if not taken and it.tidal_track_id in later_dups and rel.casefold() in fetching:
+            taken = "conflict"  # execute has placed the earlier item by now, so it finds the path taken
+        if it.dest == "fiio" and taken != "conflict":  # as at execute: a taken path is a conflict whatever the destination
             state, key = "skip (fiio-only)", "skipped_dest"
-        elif taken := _occupied(conn, library_root, it, rel):
+        elif taken:
             state, key = ("exists, skip" if taken == "exists" else "conflict"), taken
         else:
             state, key = "would fetch", "would_fetch"
+            fetching.add(rel.casefold())
         res[key] += 1
         out(f"  {state:<16} {rel}  [tidal {it.tidal_track_id}, {_fmt_dur(it.duration_s)}, dest {it.dest}]")
-    for it, owned_path in skipped:
-        out(f"  {'owned elsewhere':<16} {it.target_rel}  (owned under another title: {owned_path})")
+    _report_plan(plan, items, out)
     out(f"fetch: {res['would_fetch']} would be fetched, {res['exists']} already exist, {res['conflict']} conflict, "
-        f"{res['skipped_dest']} fiio-only skipped, {len(skipped)} owned under another title")
+        f"{res['skipped_dest']} fiio-only skipped")
     return res
 
 
 def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: list[FetchItem], staging_dir,
                 library_root, dry_run: bool = True, quality: str = DEFAULT_QUALITY, verify: bool = True, *,
-                http=None, ffmpeg: str | None = None, out=print, skipped: list | None = None) -> dict:
+                http=None, ffmpeg: str | None = None, out=print, plan: Plan | None = None) -> dict:
     """Result keys: placed, exists, conflict, held_lossy, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
     setup), until, remaining (items not attempted, including the one a stop happened on)."""
     library_root = Path(library_root)
-    skipped = skipped or []  # (item, owned path) pairs the planner left out as owned under another title
-    if dry_run:
-        return _dry_run(conn, items, library_root, quality, out, skipped)
+    if dry_run:  # `plan` is the planner's result: its skipped tracks and counts are printed with the items
+        return _dry_run(conn, items, library_root, quality, out, plan)
     staging_dir = Path(staging_dir)
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
     res = {"dry_run": False, "placed": 0, "exists": 0, "conflict": 0, "held_lossy": 0, "blocked": 0, "failed": 0,
            "skipped_dest": 0, "stopped": None, "until": None, "remaining": []}
     problem = _preflight(staging_dir, library_root, verify, ffmpeg)
     if problem:
+        _report_plan(plan, items, out)  # the plan is already built: say what it decided before the setup error
         out(f"fetch: {problem}")
         return {**res, "stopped": "setup", "remaining": list(items)}
     http = http or requests.Session()
     network_failures = 0
     for i, it in enumerate(items):
         if it.dest == "fiio":
+            if (taken := _taken(conn, library_root, it, it.target_rel)) and taken[0] == "conflict":
+                res["conflict"] += 1  # not fetched here, but a taken path is a conflict whatever the destination
+                out(f"  {'conflict':<10} {it.target_rel}  ({taken[1]})")
+                continue
             res["skipped_dest"] += 1
             out(f"  skip (fiio-only, not handled yet) {it.target_rel}")
             continue
@@ -503,13 +527,12 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
             if network_failures >= MAX_NETWORK_FAILURES:
                 res.update(stopped="network", remaining=list(items[i + 1:]))
                 break
+    _report_plan(plan, items, out)
     out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['conflict']} conflict, "
         f"{res['held_lossy']} held (lossy), "
         f"{res['blocked']} blocked, "
-        f"{res['failed']} failed, {len(res['remaining'])} not attempted, {len(skipped)} owned under another title, "
+        f"{res['failed']} failed, {res['skipped_dest']} fiio-skipped, {len(res['remaining'])} not attempted, "
         f"stopped={res['stopped']}")
-    for it, owned_path in skipped:
-        out(f"  {'owned elsewhere':<16} {it.target_rel}  (owned under another title: {owned_path})")
     for it in res["remaining"]:
         out(f"  remaining {it.target_rel}")
     return res

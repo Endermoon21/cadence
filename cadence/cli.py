@@ -15,7 +15,7 @@ from cadence.catalog.groups import regroup_all, regroup_artist
 from cadence.catalog.link import link_files
 from cadence.catalog.sync import clear_cache, pending_work, sync_all
 from cadence.fetch.plan import plan_missing
-from cadence.fetch.run import DEFAULT_QUALITY, fetch_items
+from cadence.fetch.run import DEFAULT_QUALITY, _report_plan, fetch_items
 from cadence.fetch.stream import QUALITIES, ext_for_quality
 from cadence.gate.bucket import Gate, GatePaused
 from cadence.identity.normalize import norm_artist
@@ -186,40 +186,43 @@ def cmd_fetch(args, conn) -> int:
     if err:
         print(f"fetch: {err}", file=sys.stderr)
         return 1
-    twins: list = []
-    items = plan_missing(conn, artist_id, release_id, args.include_variants, ext_for_quality(args.quality),
-                         args.scope, twins)
-    if args.limit:
-        items = items[:args.limit]
+    plan = plan_missing(conn, artist_id, release_id, args.include_variants, ext_for_quality(args.quality), args.scope)
+    items = plan.items[:args.limit] if args.limit else plan.items
+    if len(items) < len(plan.items):
+        print(f"fetch: --limit {args.limit}: {len(plan.items) - len(items)} planned item(s) not attempted")
     if args.scope == "all" and release_id is None:
         print(f"WARNING: --scope all plans {len(items)} track(s) across {len({i.album_dir for i in items})} release(s), "
               "including whole releases you do not own at all (default scope is partial)")
     if not args.execute:
-        fetch_items(conn, None, None, items, staging, library, dry_run=True, quality=args.quality, skipped=twins)
+        fetch_items(conn, None, None, items, staging, library, dry_run=True, quality=args.quality, plan=plan)
         return 0
     gate = _gate(conn)
     until = gate.paused_until()
     if until:
+        _report_plan(plan, items, print)  # the plan is built: show its skips and collisions before stopping
         print(f"gate paused until {until.isoformat()}; not touching Tidal")
         return EXIT_PAUSED
     token = os.path.expanduser(os.environ.get("CADENCE_TIDAL_TOKEN", "~/.config/tidal_dl_ng/token.json"))
     try:
         session = _login(gate, token)
     except GatePaused as p:
+        _report_plan(plan, items, print)
         print(f"gate paused until {p.until.isoformat()}: {p.reason}")
         return EXIT_PAUSED
     except Exception as exc:
+        _report_plan(plan, items, print)
         print(f"fetch: cannot start Tidal session: {exc}", file=sys.stderr)
         return 1
-    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality, skipped=twins)
+    res = fetch_items(conn, session, gate, items, staging, library, dry_run=False, quality=args.quality, plan=plan)
     if res["stopped"] == "paused":
         print(f"gate paused until {res['until']}")
-        return EXIT_PAUSED
     if res["stopped"] == "auth":
         print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.", file=sys.stderr)
-    if res["conflict"]:
-        print(f"fetch: {res['conflict']} target(s) taken by files the ledger does not link to the track: exit 1",
-              file=sys.stderr)
+    if res["conflict"]:  # also when a pause follows: a conflict counted earlier in the run is still reported
+        print(f"fetch: {res['conflict']} target(s) taken by files the ledger does not link to the track"
+              + ("" if res["stopped"] == "paused" else ": exit 1"), file=sys.stderr)
+    if res["stopped"] == "paused":
+        return EXIT_PAUSED
     return 1 if res["stopped"] or res["failed"] or res["conflict"] else 0
 
 
@@ -256,12 +259,30 @@ def cmd_link(args, conn) -> int:
             print(f"link: no artist '{args.artist}'", file=sys.stderr)
             return 1
         artist_id = row["id"]
+    if args.review:
+        return _print_link_review(conn, artist_id)
     s = link_files(conn, artist_id, args.rematch)
     db.log_event(conn, "match", args.artist, f"link: {s['matched']} of {s['files']} file(s) matched "
-                 f"({s['isrc']} by ISRC, {s['fuzzy']} by title+duration), {s['unmatched']} unmatched", s)
+                 f"({s['isrc']} by ISRC, {s['fuzzy']} by title+duration), {s['unmatched']} unmatched, "
+                 f"{s['ambiguous']} ambiguous, {s['no_longer_matches']} no longer matching (link kept)", s)
     conn.commit()
     print(f"link: {s['files']} files, {s['matched']} matched ({s['isrc']} isrc, {s['fuzzy']} fuzzy), "
-          f"{s['unmatched']} unmatched")
+          f"{s['unmatched']} unmatched, {s['ambiguous']} ambiguous, {s['no_longer_matches']} no longer matching"
+          + ("; see `cadence link --review`" if s["ambiguous"] or s["no_longer_matches"] else ""))
+    return 0
+
+
+def _print_link_review(conn, artist_id) -> int:
+    """Read-only: one line per file `link` would not guess for."""
+    rows = conn.execute("SELECT f.path, f.recording_id, r.reason, r.candidates FROM link_review r "
+                        "JOIN file f ON f.id = r.file_id "
+                        "WHERE ?1 IS NULL OR f.artist_id = ?1 ORDER BY f.path", (artist_id,)).fetchall()
+    for r in rows:
+        cands = " | ".join(f"{c['recording_id']}  {c['norm_title']}  {c['duration_s']}  "
+                           f"{'-' if c['score'] is None else c['score']}" for c in json.loads(r["candidates"]))
+        state = "unlinked" if r["recording_id"] is None else f"linked to {r['recording_id']}"
+        print(f"{r['path']}  {r['reason']}  {state}  {cands}")
+    print(f"link --review: {len(rows)} file(s) need review")
     return 0
 
 
@@ -409,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("link", help="match files to recordings")
     s.add_argument("--artist")
     s.add_argument("--rematch", action="store_true")
+    s.add_argument("--review", action="store_true", help="list files held back for review (changes nothing)")
     s.set_defaults(fn=cmd_link)
 
     s = sub.add_parser("regroup", help="recompute release groups and recording clusters (no network)")

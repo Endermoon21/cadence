@@ -59,7 +59,7 @@ def rows(conn, table="file"):
 def run(conn, session, http, dirs, **kw):
     stg, lib = dirs
     out: list[str] = []
-    res = fetch_items(conn, session, kw.pop("gate", make_gate()), kw.pop("items", None) or plan_missing(conn, scope="all"), stg, lib,
+    res = fetch_items(conn, session, kw.pop("gate", make_gate()), kw.pop("items", None) or plan_missing(conn, scope="all").items, stg, lib,
                       dry_run=False, quality=kw.pop("quality", "LOSSLESS"), http=http,
                       out=out.append, **kw)
     return res, out
@@ -89,7 +89,7 @@ def test_places_a_tagged_flac_and_records_the_file_row(flac, dirs):
     [ev] = rows(conn, "event_log")
     assert ev["kind"] == "fetch.placed" and ev["subject"] == f["path"]
     assert [c[1]["audioquality"] for c in session.calls] == ["LOSSLESS"] and http.urls == [URL.format(1)]
-    assert plan_missing(conn, scope="all") == []  # linked now, so no longer missing
+    assert plan_missing(conn, scope="all").items == []  # linked now, so no longer missing
 
 
 def cross_device(monkeypatch, lib, seen):
@@ -248,7 +248,7 @@ def test_a_held_track_does_not_skip_or_overwrite_the_same_titled_track_on_anothe
     for disc, tid in ((1, 1), (2, 2)):  # same number and title, two different Tidal tracks, told apart by the disc
         add_track(conn, rel, add_recording(conn, a, "Song", isrc=f"{ISRC[:-1]}{tid}"), 1, "Song", tid, disc=disc)
     conn.commit()
-    items = plan_missing(conn, scope="all")
+    items = plan_missing(conn, scope="all").items
     assert [i.target_rel for i in items] == ["Neil Young/Harvest/D1-01 - Song.flac", "Neil Young/Harvest/D2-01 - Song.flac"]
     stg, lib = dirs
     held = stg / "Neil Young/Harvest/D1-01 - Song [tidal 1].m4a"
@@ -280,7 +280,7 @@ def test_two_discs_with_the_same_track_and_title_are_both_fetched_under_distinct
     assert sorted((f["path"], f["tag_disc"]) for f in files) == \
         [("Neil Young/Harvest/D1-01 - Intro.flac", "1"), ("Neil Young/Harvest/D2-01 - Intro.flac", "2")]
     assert len({f["recording_id"] for f in files}) == 2
-    assert plan_missing(conn, scope="all") == []
+    assert plan_missing(conn, scope="all").items == []
 
 
 @needs_ffmpeg
@@ -472,9 +472,9 @@ def test_an_unlinked_file_at_the_target_is_a_conflict_that_is_logged_and_fetches
     rel = "Neil Young/Harvest/01 - Song 1.flac"
     (lib / rel).parent.mkdir(parents=True)
     (lib / rel).write_bytes(b"placeholder")
-    add_file(conn, rel, a)  # unlinked legacy file, 9 s against Tidal's 4 s: outside the tolerance, so nothing claims it
-    conn.execute("UPDATE file SET duration_s = 9")
-    items = plan_missing(conn, scope="all")
+    add_file(conn, rel, a)  # unlinked legacy file with the same title, number and length: the planner ignores all that
+    conn.execute("UPDATE file SET tag_title = 'Song 1', tag_track = '1', duration_s = 4")
+    items = plan_missing(conn, scope="all").items
     assert [i.target_rel for i in items] == [rel]
     session, http = tidal(1), FakeHttp()
     res, out = run(conn, session, http, dirs, items=items, verify=False)
@@ -488,7 +488,7 @@ def test_an_unlinked_file_at_the_target_is_a_conflict_that_is_logged_and_fetches
 
 def test_a_target_the_ledger_links_to_this_recording_is_exists_not_a_conflict(dirs):
     conn, a = seed(1)
-    items = plan_missing(conn, scope="all")
+    items = plan_missing(conn, scope="all").items
     add_file(conn, "Neil Young/Harvest/01 - Song 1.flac", a, conn.execute("SELECT id FROM recording").fetchone()[0])
     res, _ = run(conn, tidal(1), FakeHttp(), dirs, items=items, verify=False)
     assert (res["exists"], res["conflict"]) == (1, 0) and rows(conn, "event_log") == []
@@ -502,7 +502,7 @@ def test_dry_run_is_the_default_and_makes_no_calls_and_no_writes(flac, dirs):
     (lib / "Neil Young/Harvest/01 - Song 1.flac").write_bytes(b"x")
     session, http, out = tidal(2), FakeHttp(default=flac), []
     before = (len(rows(conn)), len(rows(conn, "event_log")), sorted(p for p in lib.rglob("*")))
-    res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all"), stg, lib, out=out.append)
+    res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all").items, stg, lib, out=out.append)
     assert res["dry_run"] and (res["would_fetch"], res["exists"], res["conflict"]) == (1, 0, 1)
     assert session.calls == [] and http.urls == []
     assert not stg.exists()
@@ -517,7 +517,7 @@ def test_429_stops_cleanly_with_no_partial_file(flac, dirs):
     session = tidal(3, t2=TooManyRequests(120))
     http = FakeHttp({URL.format(1): flac, URL.format(3): flac})
     gate = make_gate()
-    items = plan_missing(conn, scope="all")
+    items = plan_missing(conn, scope="all").items
     res, _ = run(conn, session, http, dirs, gate=gate, items=items)
     stg, lib = dirs
     assert (res["placed"], res["stopped"]) == (1, "paused") and res["until"]
@@ -547,17 +547,45 @@ def test_401_on_one_tracks_playback_blocks_that_track_and_continues(flac, dirs):
     assert [f["path"] for f in rows(conn)] == ["Neil Young/Harvest/02 - Song 2.flac"]
 
 
-def test_execute_output_names_each_track_owned_under_another_title_and_its_file(dirs):
-    conn, a = seed(2)
-    [song1, _] = plan_missing(conn, scope="all")
+def skippy(n=2):
+    """Harvest is partial (Song 1 is owned, linked), Song 2 is planned; 'Lonely' is a release nobody owns (skipped)."""
+    conn, a = seed(n)
+    add_file(conn, "Neil Young/Harvest/01 - Song 1.flac", a, 1)
+    lonely = add_release(conn, a, "Untouched", 200, date="2020-01-01")
+    add_track(conn, lonely, add_recording(conn, a, "Lonely"), 1, "Lonely", 99)
+    conn.commit()
+    return conn
+
+
+def test_dry_run_and_execute_print_the_same_skip_lines_and_plan_counts(dirs):
+    conn = skippy()
+    plan = plan_missing(conn)
+    assert [i.title for i in plan.items] == ["Song 2"] and plan.owned == 1 and len(plan.skipped) == 1
+    stg, lib = dirs
+    dry: list[str] = []
+    fetch_items(conn, None, None, plan.items, stg, lib, out=dry.append, plan=plan)
+    live: list[str] = []
+    res = fetch_items(conn, tidal(0), make_gate(), [], stg, lib, dry_run=False, verify=False, out=live.append, plan=plan)
+    assert res["stopped"] is None
+
+    def skips(lines):
+        return [x for x in lines if x.lstrip().startswith("skip ")]
+
+    def counts(lines):
+        return [x for x in lines if x.startswith("plan:") or "skipped:" in x]
+    assert skips(dry) == skips(live) == [plan.skipped[0].line()] and len(skips(dry)) == 1
+    assert "Untouched / 01 - Lonely  [tidal 99]  (partial scope: release has no owned track)" in skips(dry)[0]
+    assert counts(dry) == counts(live) == plan.summary_lines()
+    assert counts(dry)[0] == "plan: 1 planned, 1 owned, 1 skipped"
+    assert not any("owned under another title" in x or "owned elsewhere" in x for x in dry + live)
+
+
+def test_a_run_without_a_plan_prints_no_plan_lines(dirs):
+    conn, a = seed(1)
     stg, lib = dirs
     out: list[str] = []
-    res = fetch_items(conn, tidal(0), make_gate(), [], stg, lib, dry_run=False, out=out.append,
-                      skipped=[(song1, "Neil Young/Harvest/Old Song One.flac")])
-    text = "\n".join(out)
-    assert "Song 1" in text and "Neil Young/Harvest/Old Song One.flac" in text
-    assert "1 owned under another title" in text
-    assert res["stopped"] is None
+    fetch_items(conn, None, None, plan_missing(conn, scope="all").items, stg, lib, out=out.append)
+    assert not any(x.startswith("plan:") or x.lstrip().startswith("skip ") for x in out)
 
 
 def test_a_401_about_the_token_stops_the_run(dirs):
@@ -593,7 +621,7 @@ def test_segmented_hi_res_stream_is_remuxed_into_a_flac(flac, dirs, tmp_path):
                      **{f"https://cdn.example/seg{n}": p for n, p in enumerate(parts[1:], 1)}})
     session = FakeTidal({1: mpd_body(xml, bitDepth=16, sampleRate=44100)})
     stg, lib = dirs
-    res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all"), stg, lib, dry_run=False,
+    res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all").items, stg, lib, dry_run=False,
                       quality="HI_RES_LOSSLESS", http=http, out=lambda s: None)
     assert (res["placed"], res["failed"]) == (1, 0)
     [f] = rows(conn)
@@ -643,10 +671,46 @@ def test_cli_default_scope_is_partial_and_all_warns(cli_env, monkeypatch, capsys
     c.close()
     assert cli.main(["fetch", "--artist", "neil young"]) == 0
     out = capsys.readouterr().out
-    assert "Harvest/02 - Song 2.flac" in out and "Lonely" not in out and "WARNING" not in out
+    assert "Harvest/02 - Song 2.flac" in out and "WARNING" not in out
+    assert [x for x in out.splitlines() if "would fetch" in x and "Lonely" in x] == []  # not planned...
+    [skip] = [x for x in out.splitlines() if x.lstrip().startswith("skip ")]  # ...but said so, with reason and id
+    assert "Lonely" in skip and "[tidal 99]" in skip and "partial scope: release has no owned track" in skip
+    assert "plan: 1 planned, 1 owned, 1 skipped" in out
     assert cli.main(["fetch", "--artist", "neil young", "--scope", "all"]) == 0
     out = capsys.readouterr().out
     assert "Lonely" in out and "WARNING: --scope all plans 2 track(s) across 2 release(s)" in out
+
+
+@needs_ffmpeg
+def test_cli_dry_run_and_execute_print_the_same_skip_lines(cli_env, monkeypatch, capsys):
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    c.execute("INSERT INTO release(artist_id, title, norm_title, type) SELECT 1, 'Untouched', 'untouched', 'album'")
+    add_track(c, c.execute("SELECT last_insert_rowid()").fetchone()[0], add_recording(c, 1, "Lonely"), 1, "Lonely", 99)
+    add_file(c, "Neil Young/Harvest/01 - Song 1.flac", 1, 1)
+    c.commit()
+    c.close()
+    album = cli_env / "lib" / "Neil Young" / "Harvest"
+    album.mkdir(parents=True)
+    (album / "02 - Song 2.flac").write_bytes(b"not ours")  # unlinked: Song 2 is planned and ends as a conflict
+    monkeypatch.setattr(cli, "_login", lambda gate, token: FakeTidal())
+    assert cli.main(["fetch", "--artist", "neil young"]) == 0
+    dry = capsys.readouterr().out.splitlines()
+    assert cli.main(["fetch", "--execute", "--artist", "neil young"]) == 1  # conflict: exit code unchanged
+    live = capsys.readouterr().out.splitlines()
+
+    def skips(lines):
+        return [x for x in lines if x.lstrip().startswith("skip ")]
+    assert len(skips(dry)) == 1 and skips(dry) == skips(live)
+    assert [x for x in dry if x.startswith("plan:")] == [x for x in live if x.startswith("plan:")] == \
+        ["plan: 1 planned, 1 owned, 1 skipped"]
+    assert "conflict" in "\n".join(live)
+
+
+def test_cli_limit_says_how_many_planned_items_were_not_attempted(cli_env, capsys):
+    assert cli.main(["fetch", "--artist", "neil young", "--scope", "all", "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "--limit 1: 1 planned item(s) not attempted" in out and "plan: 2 planned, 0 owned, 0 skipped" in out
 
 
 def test_cli_requires_paths_from_the_environment(cli_env, monkeypatch, capsys):
@@ -681,6 +745,20 @@ def test_a_library_mount_without_hard_links_stops_at_setup_before_any_tidal_call
     res, out = run(conn, session, http, dirs)
     assert res["stopped"] == "setup" and len(res["remaining"]) == 1 and "hard links are required" in out[0]
     assert session.calls == [] and http.urls == [] and list(lib.iterdir()) == []  # the probe files are gone
+
+
+@needs_ffmpeg
+def test_cli_reports_a_conflict_counted_before_a_pause_and_still_exits_3(cli_env, monkeypatch, capsys):
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    add_file(c, "Neil Young/Harvest/01 - Song 1.flac", 1)  # unlinked: Song 1 is a conflict, then Song 2 hits a 429
+    c.commit()
+    c.close()
+    monkeypatch.setattr(cli, "_login", lambda gate, token: FakeTidal({2: TooManyRequests(300)}))
+    assert cli.main(["fetch", "--execute", "--artist", "neil young", "--scope", "all"]) == cli.EXIT_PAUSED
+    cap = capsys.readouterr()
+    assert "gate paused until" in cap.out and "1 conflict" in cap.out
+    assert "1 target(s) taken by files the ledger does not link to the track" in cap.err
 
 
 @needs_ffmpeg
@@ -759,3 +837,235 @@ def test_a_file_exists_error_with_nothing_at_the_target_is_still_a_failure(flac,
     monkeypatch.setattr(fetch_run, "_move_into_library", refused)
     res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
     assert (res["placed"], res["conflict"], res["failed"]) == (0, 0, 1)
+
+
+# ---- collisions: planned, listed up front, a conflict at execute ----
+
+COLLIDING = "Neil Young/Harvest/01 - Song 1.flac"
+
+
+def hidden_twin_holds_song_1(conn):
+    """Song 1 (tidal 1) is planned, but its target path is the path of a file linked to its hidden twin."""
+    hidden = add_release(conn, 1, "Harvest", 101)
+    conn.execute("UPDATE release SET hidden_reason = 'duplicate' WHERE id = ?", (hidden,))
+    add_track(conn, hidden, add_recording(conn, 1, "Song 1 twin"), 1, "Song 1", 90)
+    add_file(conn, COLLIDING, 1, conn.execute("SELECT id FROM recording WHERE title = 'Song 1 twin'").fetchone()[0])
+    conn.commit()
+
+
+def test_dry_run_and_execute_print_the_collision_line_before_the_summary_and_the_track_stays_planned(dirs):
+    conn, a = seed(2)
+    hidden_twin_holds_song_1(conn)
+    plan = plan_missing(conn, scope="all")
+    assert [i.tidal_track_id for i in plan.items] == [1, 2] and len(plan.collisions) == 1
+    line = (f"  collision  {COLLIDING}  planned tidal 1, file already linked to another recording  "
+            "(may conflict at execute)")
+    stg, lib = dirs
+    dry: list[str] = []
+    fetch_items(conn, None, None, plan.items, stg, lib, out=dry.append, plan=plan)
+    live: list[str] = []
+    # the path is only in the ledger, not on disk: the executor still sees it taken (it checks the ledger too)
+    res = fetch_items(conn, tidal(0), make_gate(), plan.items[:1], stg, lib, dry_run=False, verify=False,
+                      out=live.append, plan=plan)
+    assert line in dry and line in live
+    for lines in (dry, live):
+        assert lines.index(line) < [x.startswith("plan:") for x in lines].index(True)
+        assert [x for x in lines if x.startswith("plan:")] == ["plan: 2 planned, 1 owned, 0 skipped, 1 collision"]
+    assert any("conflict" in x and COLLIDING in x and "would fetch" not in x for x in dry)
+    assert res["conflict"] == 1 and res["placed"] == 0 and not (lib / COLLIDING).exists()
+
+
+def test_a_collision_line_is_not_printed_for_an_item_that_is_not_attempted(dirs):
+    conn, a = seed(2)
+    hidden_twin_holds_song_1(conn)
+    plan = plan_missing(conn, scope="all")
+    out: list[str] = []
+    fetch_items(conn, None, None, plan.items[1:], dirs[0], dirs[1], out=out.append, plan=plan)
+    assert not any(x.lstrip().startswith("collision") for x in out)
+
+
+@needs_ffmpeg
+def test_cli_collision_is_listed_in_the_dry_run_and_the_execute_exits_1_only_through_the_conflict(cli_env, monkeypatch,
+                                                                                                capsys):
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    hidden_twin_holds_song_1(c)
+    c.close()
+    monkeypatch.setattr(cli, "_login", lambda gate, token: FakeTidal())
+    assert cli.main(["fetch", "--artist", "neil young", "--scope", "all", "--limit", "1"]) == 0  # dry run: exit code unchanged
+    dry = capsys.readouterr().out
+    assert cli.main(["fetch", "--execute", "--artist", "neil young", "--scope", "all", "--limit", "1"]) == 1
+    live = capsys.readouterr().out
+    for out in (dry, live):
+        assert [x for x in out.splitlines() if x.lstrip().startswith("collision")] == [
+            f"  collision  {COLLIDING}  planned tidal 1, file already linked to another recording  "
+            "(may conflict at execute)"]
+    assert "1 conflict" in live and not (cli_env / "lib" / "Neil Young").exists()
+
+
+# ---- duplicate targets inside one plan: the later item is a conflict in the dry run and at execute ----
+
+def twin_aaa(dest="server"):
+    """Two releases titled 'Aaa LP', track 1 'Song' on different recordings: one target path, tidal ids 1 and 2."""
+    conn = ledger()
+    a = add_artist(conn, dest=dest)
+    for tid, date in ((1, "2000-01-01"), (2, "2001-01-01")):
+        rel = add_release(conn, a, "Aaa LP", 100 + tid, date=date)
+        add_track(conn, rel, add_recording(conn, a, "Song", isrc=f"{ISRC[:-1]}{tid}"), 1, "Song", tid)
+    conn.commit()
+    return conn
+
+
+@needs_ffmpeg
+def test_dry_run_counts_the_later_duplicate_target_as_a_conflict_like_execute(flac, dirs):
+    conn = twin_aaa()
+    plan = plan_missing(conn, scope="all")
+    path = "Neil Young/Aaa LP/01 - Song.flac"
+    assert [(i.tidal_track_id, i.target_rel) for i in plan.items] == [(1, path), (2, path)]
+    assert [(c.tidal_track_id, c.kind) for c in plan.collisions] == [(2, "duplicate")]
+    stg, lib = dirs
+    dry_out: list[str] = []
+    dry = fetch_items(conn, None, None, plan.items, stg, lib, dry_run=True, quality="LOSSLESS", out=dry_out.append,
+                      plan=plan)
+    states = [x.split("  ")[1].strip() for x in dry_out if x.startswith("  ") and path in x and "collision" not in x]
+    assert states == ["would fetch", "conflict"]
+    assert (dry["would_fetch"], dry["conflict"]) == (1, 1)
+    assert "1 would be fetched, 0 already exist, 1 conflict" in dry_out[-1]
+    res, _ = run(conn, tidal(2), FakeHttp({URL.format(1): flac, URL.format(2): flac}), dirs, items=plan.items, plan=plan)
+    assert (res["placed"], res["conflict"]) == (dry["would_fetch"], dry["conflict"])
+
+
+def test_dry_run_duplicate_conflict_needs_the_earlier_item_to_be_fetched(dirs):
+    stg, lib = dirs
+    conn = twin_aaa()
+    plan = plan_missing(conn, scope="all")
+    later = fetch_items(conn, None, None, plan.items[1:], stg, lib, out=lambda x: None, plan=plan)  # --limit-like subset
+    assert (later["would_fetch"], later["conflict"]) == (1, 0)
+    conn = twin_aaa("fiio")                                  # nothing is placed for fiio-only items: no conflict
+    plan = plan_missing(conn, scope="all")
+    both = fetch_items(conn, None, None, plan.items, stg, lib, out=lambda x: None, plan=plan)
+    assert (both["skipped_dest"], both["conflict"], both["would_fetch"]) == (2, 0, 0)
+    res, _ = run(conn, tidal(0), FakeHttp(), dirs, items=plan.items, plan=plan, verify=False)
+    assert (res["skipped_dest"], res["conflict"]) == (2, 0)
+
+
+# ---- fiio-only items: the occupied-path check still runs at execute ----
+
+def fiio_seed(n=2):
+    conn, a = seed(n)
+    conn.execute("UPDATE artist SET default_dest = 'fiio'")
+    conn.commit()
+    return conn, a
+
+
+def test_a_fiio_item_whose_target_is_held_by_a_linked_foreign_file_is_a_conflict_at_execute(dirs):
+    conn, a = fiio_seed(2)
+    hidden_twin_holds_song_1(conn)
+    plan = plan_missing(conn, scope="all")
+    assert [i.dest for i in plan.items] == ["fiio", "fiio"] and len(plan.collisions) == 1
+    session, http = tidal(0), FakeHttp()
+    res, out = run(conn, session, http, dirs, items=plan.items, plan=plan, verify=False)
+    assert (res["conflict"], res["skipped_dest"], res["placed"]) == (1, 1, 0)
+    [ev] = [r for r in rows(conn, "event_log") if r["kind"] == "fetch.conflict"]
+    assert ev["subject"] == COLLIDING and '"tidal_track_id": 1' in ev["data_json"]
+    assert f"  collision  {COLLIDING}  planned tidal 1, file already linked to another recording  " \
+           "(fiio-only, checked in dry run and at execute)" in out
+    assert "1 conflict" in out[-1] and "1 fiio-skipped" in out[-1]
+    assert session.calls == [] and http.urls == []
+
+
+@needs_ffmpeg
+def test_cli_execute_exits_1_for_a_fiio_item_colliding_with_a_linked_file(cli_env, monkeypatch, capsys):
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    c.execute("UPDATE artist SET default_dest = 'fiio'")
+    hidden_twin_holds_song_1(c)
+    c.close()
+    monkeypatch.setattr(cli, "_login", lambda gate, token: FakeTidal())
+    assert cli.main(["fetch", "--execute", "--artist", "neil young", "--scope", "all", "--limit", "1"]) == 1
+    cap = capsys.readouterr()
+    assert "1 conflict" in cap.out and "exit 1" in cap.err
+
+
+def test_dry_run_and_execute_agree_on_a_fiio_item_whose_target_is_held_by_an_unlinked_file(dirs):
+    conn, a = fiio_seed(2)
+    stg, lib = dirs
+    rel = "Neil Young/Harvest/01 - Song 1.flac"
+    add_file(conn, rel, a)  # unlinked: the planner ignores it, the executor and the dry run must not
+    items = plan_missing(conn, scope="all").items
+    before = rows(conn, "file"), rows(conn, "event_log")
+    dry_out: list[str] = []
+    dry = fetch_items(conn, None, None, items, stg, lib, dry_run=True, quality="LOSSLESS", out=dry_out.append)
+    assert (dry["conflict"], dry["skipped_dest"]) == (1, 1) and (rows(conn, "file"), rows(conn, "event_log")) == before
+    assert any(x.split()[0] == "conflict" and rel in x for x in dry_out) and "1 conflict" in dry_out[-1]
+    res, out = run(conn, tidal(0), FakeHttp(), dirs, items=items, verify=False)
+    assert (res["conflict"], res["skipped_dest"]) == (dry["conflict"], dry["skipped_dest"]) and "1 conflict" in out[-1]
+
+
+def test_fiio_items_without_a_collision_are_skipped_and_counted_in_the_execute_summary(dirs):
+    conn, a = fiio_seed(2)
+    items = plan_missing(conn, scope="all").items
+    add_file(conn, "Neil Young/Harvest/02 - Song 2.flac", a, 2)  # linked to its own track since: not a conflict
+    res, out = run(conn, tidal(0), FakeHttp(), dirs, items=items, verify=False)
+    assert (res["skipped_dest"], res["conflict"], res["exists"]) == (2, 0, 0)
+    assert "0 conflict" in out[-1] and "2 fiio-skipped" in out[-1] and rows(conn, "event_log") == []
+
+
+# ---- early exits still print what the plan decided ----
+
+def orphan_skip(conn):
+    """A track with no Tidal id: the plan skips it ('no tidal id')."""
+    add_track(conn, 1, add_recording(conn, 1, "Orphan"), 9, "Orphan", None)
+    conn.commit()
+
+
+def test_a_setup_error_prints_the_plan_skip_lines_before_the_error(dirs):
+    conn, a = seed(1)
+    orphan_skip(conn)
+    plan = plan_missing(conn, scope="all")
+    stg, lib = dirs
+    out: list[str] = []
+    res = fetch_items(conn, tidal(1), make_gate(), plan.items, stg, lib / "missing", dry_run=False, out=out.append,
+                      plan=plan)
+    assert res["stopped"] == "setup" and len(res["remaining"]) == 1
+    [skip] = [x for x in out if x.lstrip().startswith("skip ")]
+    assert "Orphan" in skip and "no tidal id" in skip
+    assert out.index(skip) < [i for i, x in enumerate(out) if "does not exist" in x][0]
+    assert "plan: 1 planned, 0 owned, 1 skipped" in out
+
+
+@pytest.mark.parametrize("failure", ["error", "paused"])
+def test_cli_login_failure_after_the_plan_still_prints_the_skip_lines(cli_env, monkeypatch, capsys, failure):
+    from datetime import datetime, timedelta, timezone
+    from cadence.gate.bucket import GatePaused
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    orphan_skip(c)
+    c.close()
+
+    def login(gate, token):
+        raise GatePaused(datetime.now(timezone.utc) + timedelta(minutes=5), "test") if failure == "paused" \
+            else RuntimeError("no token")
+    monkeypatch.setattr(cli, "_login", login)
+    assert cli.main(["fetch", "--execute", "--artist", "neil young", "--scope", "all"]) == \
+        (cli.EXIT_PAUSED if failure == "paused" else 1)
+    cap = capsys.readouterr()
+    [skip] = [x for x in cap.out.splitlines() if x.lstrip().startswith("skip ")]
+    assert "Orphan" in skip and "no tidal id" in skip
+    assert "plan: 2 planned, 0 owned, 1 skipped" in cap.out
+
+
+def test_cli_paused_gate_after_the_plan_still_prints_the_skip_lines(cli_env, monkeypatch, capsys):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from cadence.ledger import db
+    c = db.connect(cli_env / "c.db")
+    orphan_skip(c)
+    c.close()
+    until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    monkeypatch.setattr(cli, "_gate", lambda conn, *a: SimpleNamespace(paused_until=lambda: until))
+    monkeypatch.setattr(cli, "_login", lambda *a: pytest.fail("a paused gate must not log in"))
+    assert cli.main(["fetch", "--execute", "--artist", "neil young", "--scope", "all"]) == cli.EXIT_PAUSED
+    out = capsys.readouterr().out
+    assert any(x.lstrip().startswith("skip ") and "no tidal id" in x for x in out.splitlines())
+    assert out.index("no tidal id") < out.index("gate paused until")

@@ -33,6 +33,7 @@ def _repoint_files(conn: sqlite3.Connection, alias_norm: str, artist_id: int) ->
         if f["match"] != "manual":  # a link to the old artist's recording is stale now
             conn.execute("UPDATE file SET recording_id = NULL, match = 'unmatched', match_score = NULL "
                          "WHERE id = ?", (f["id"],))
+            conn.execute("DELETE FROM link_review WHERE file_id = ?", (f["id"],))  # its candidates were the old artist's
             reset += 1
     return moved, reset
 
