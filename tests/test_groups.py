@@ -248,3 +248,39 @@ def test_prefixed_pair_on_albums_of_different_or_unknown_years_stays_apart():
         sync_artist(conn, cat, row(conn, aid))
         assert canon_by_isrc(conn)["K1"] == "K1", date                # 'Night - Alpha' (1980) vs plain 'Alpha' (2019 / no date)
         assert canon_by_isrc(conn)["I2"] == "I2" and canon_by_isrc(conn)["K2"] == "I2"   # old rule untouched
+
+
+# ---------------------------------------------------------------- remaster-year marker left in the title (R2)
+
+def remaster_year_setup():
+    """Night (1980) keeps '(2011 Remaster)' behind the album prefix and a truncated '(2013 Remaste' in the title
+    (a plain '(2011 Remaster)' is already a flag and makes no difference); its deluxe has them plain."""
+    return will_setup(
+        [rel(10, "Night", [WILL], "album", "1980-01-01"), rel(11, "Night (Deluxe)", [WILL], "album", "1980-11-01"),
+         rel(12, "Day", [WILL], "album", "1990-01-01")],
+        {10: [trk(100, "Night - Alpha (2011 Remaster)", 200, "I1", 1), trk(101, "Beta (2013 Remaste", 180, "I2", 2),
+              trk(102, "Night - Gamma (2011 Remaster)", 200, "I3", 3), trk(103, "Night - Skit (2011 Remaster)", 40, "I4", 4),
+              trk(104, "Love 1985", 200, "I5", 5)],
+         11: [trk(110, "Alpha", 202, "K1", 1), trk(111, "Beta", 182, "K2", 2), trk(112, "Gamma", 206, "K3", 3),
+              trk(113, "Skit", 40, "K4", 4), trk(114, "Love", 200, "K5", 5)],
+         12: [trk(120, "Beta", 190, "D2", 1)]})
+
+
+def test_regroup_merges_the_remaster_year_marked_pairs_and_leaves_the_others_apart():
+    conn, aid, cat = remaster_year_setup()
+    sync_artist(conn, cat, row(conn, aid))
+    ids = {r["isrc"]: r["id"] for r in conn.execute("SELECT id, isrc FROM recording")}
+    conn.execute("UPDATE recording SET canon_id = id")                   # the ledger as the old rule left it
+    conn.commit()
+    before = dict(tuple(r) for r in conn.execute("SELECT id, canon_id FROM recording"))
+    stats = regroup_artist(conn, aid)
+    after = dict(tuple(r) for r in conn.execute("SELECT id, canon_id FROM recording"))
+    assert canon_by_isrc(conn) == {"I1": "I1", "K1": "I1",              # 'night alpha 2011 remaster' + 'alpha', 2 s apart
+                                   "I2": "I2", "K2": "I2",              # '(2013 Remaste' + 'beta', 2 s apart
+                                   "D2": "D2",                          # a 'Beta' on another album group: not a partner
+                                   "I3": "I3", "K3": "K3",              # 6 s apart
+                                   "I4": "I4", "K4": "K4",              # under 60 s
+                                   "I5": "I5", "K5": "K5"}              # a bare year is not a marker
+    assert {i for i in before if before[i] != after[i]} == {ids["K1"], ids["K2"]}
+    assert (stats["recordings"], stats["clusters"]) == (11, 9)
+    assert regroup_artist(conn, aid) == stats and dict(tuple(r) for r in conn.execute("SELECT id, canon_id FROM recording")) == after

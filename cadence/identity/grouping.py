@@ -22,6 +22,10 @@ ALBUM_TITLE_TOLERANCE_S = 1                          # tighter: the titles only 
 ALBUM_TITLE_MIN_DURATION_S = 60                      # intros / skits: a few seconds of equal length mean nothing
 _NO_DATE = "9999-99-99"  # sorts after every real date
 _VARIANT_TAIL_RE = re.compile(r"\s*\[[^\[\]]*\]$")  # the ' [live]' label norm_title appends for a variant
+# a remaster marker some titles keep: '(2013 Remaster)' / '(Remastered 2013)' (a year and 'remaster' in one pair of
+# parentheses) or, as norm_title stores it, a trailing '2013 remaster' / 'remastered' / 'remaste' (truncated by Tidal)
+_REMASTER_YEAR_RE = re.compile(
+    r"\s*\((?=[^()]*\b(?:19|20)\d\d\b)[^()]*remaste[^()]*\)|\s+(?:19|20)\d\d\s+remaste(?:r|red)?$")
 
 
 class RecordingItem(NamedTuple):
@@ -51,6 +55,13 @@ def release_group_key(title: str, version: str | None, type: str) -> str:
     """Same key for a release and its remaster / deluxe / expanded editions; live, remix... editions differ."""
     p = split_title(title, version, release=True)
     return f"{type}|{p.base}" + (f" [{p.variant}]" if p.variant else "")
+
+
+def strip_remaster_year(norm: str) -> str:
+    """norm_title without a '<year> remaster' marker, for grouping only; unchanged if there is none or nothing would
+    be left. A bare year ('love 1985') is never a marker."""
+    out = " ".join(_REMASTER_YEAR_RE.sub(" ", norm).split()) if _REMASTER_YEAR_RE.search(norm) else norm
+    return out or norm
 
 
 def album_prefix(norm: str, prefixes) -> str:
@@ -97,7 +108,13 @@ def cluster_recordings(items: Sequence[RecordingItem]) -> list[list[int]]:
     makes the titles equal and non-empty, the variant is the same, and both durations are known and within
     ALBUM_TITLE_TOLERANCE_S of each other. The ISRC need not match. Each singleton joins at most one partner (the
     closest by duration, then id), so a new cluster has exactly two members; a cluster the old rule formed never
-    gains a member, changes its head or splits."""
+    gains a member, changes its head or splits.
+
+    Remaster-year marker (the R2 pass, run after the one above on the recordings still alone): titles that keep
+    '<year> remaster' ('american beauty box of rain 2013 remaster', 'box of rain 2013 remaste') are compared with
+    the marker cut off (strip_remaster_year; a bare year is not a marker), then the album prefix as above. At least
+    one side must have lost a marker, they must share an album release group, and the durations (both known, >= 60 s)
+    may differ by CLUSTER_TOLERANCE_S. Same variant, same one-partner-at-most and no-joining-a-cluster rules."""
     parent = {i.id: i.id for i in items}
     by_title: dict[tuple[str, str | None], list[tuple[int, int]]] = {}
     by_isrc: dict[str, int] = {}
@@ -122,31 +139,34 @@ def cluster_recordings(items: Sequence[RecordingItem]) -> list[list[int]]:
     size: dict[int, int] = {}
     for rid in parent:
         size[_find(parent, rid)] = size.get(_find(parent, rid), 0) + 1
-    by_album: dict[tuple[str | None, str, str], list[tuple[int, int, bool, frozenset[int]]]] = {}
-    for item in items:
-        if item.duration_s is None or item.duration_s < ALBUM_TITLE_MIN_DURATION_S or not item.albums \
-                or size[_find(parent, item.id)] > 1:
-            continue                                         # only recordings the old rule left alone take part
-        for gk in {g for g, *_ in item.albums}:
-            prefix = album_prefix(item.norm_title, {t for g, t, _ in item.albums if g == gk})
-            stripped = item.norm_title[len(prefix) + 1:].strip() if prefix else item.norm_title
-            # release years of the album: the prefix release for a prefixed title, any album of the group otherwise
-            years = frozenset(y for g, t, y in item.albums if g == gk and (not prefix or t == prefix) and y is not None)
-            by_album.setdefault((item.variant, stripped, gk), []).append(
-                (item.duration_s, item.id, bool(prefix), years))
     paired: set[int] = set()
-    for key in sorted(by_album, key=str):
-        members = sorted(by_album[key], key=lambda m: m[:2])
-        for n, (dur, rid, prefixed, years) in enumerate(members):
-            if rid in paired:
-                continue
-            for dur2, rid2, prefixed2, years2 in members[n + 1:]:
-                if dur2 - dur > ALBUM_TITLE_TOLERANCE_S:
-                    break
-                if rid2 not in paired and (prefixed or prefixed2) and years & years2:
-                    _union(parent, rid, rid2)
-                    paired.update((rid, rid2))
-                    break
+    for year_pass in (False, True):          # pass 2 (remaster-year marker, 3 s) only sees what pass 1 left alone
+        by_album: dict[tuple[str | None, str, str], list[tuple[int, int, bool, frozenset[int]]]] = {}
+        for item in items:
+            if item.duration_s is None or item.duration_s < ALBUM_TITLE_MIN_DURATION_S or not item.albums \
+                    or size[_find(parent, item.id)] > 1 or item.id in paired:
+                continue                                     # only recordings the old rule left alone take part
+            norm = strip_remaster_year(item.norm_title) if year_pass else item.norm_title
+            for gk in {g for g, *_ in item.albums}:
+                prefix = album_prefix(norm, {t for g, t, _ in item.albums if g == gk})
+                stripped = norm[len(prefix) + 1:].strip() if prefix else norm
+                # release years of the album: the prefix release for a prefixed title, any album of the group otherwise
+                years = frozenset(y for g, t, y in item.albums if g == gk and (not prefix or t == prefix) and y is not None)
+                by_album.setdefault((item.variant, stripped, gk), []).append(
+                    (item.duration_s, item.id, norm != item.norm_title if year_pass else bool(prefix), years))
+        tolerance = CLUSTER_TOLERANCE_S if year_pass else ALBUM_TITLE_TOLERANCE_S
+        for key in sorted(by_album, key=str):
+            members = sorted(by_album[key], key=lambda m: m[:2])
+            for n, (dur, rid, changed, years) in enumerate(members):
+                if rid in paired:
+                    continue
+                for dur2, rid2, changed2, years2 in members[n + 1:]:
+                    if dur2 - dur > tolerance:
+                        break
+                    if rid2 not in paired and (changed or changed2) and (year_pass or years & years2):
+                        _union(parent, rid, rid2)
+                        paired.update((rid, rid2))
+                        break
     rank = {i.id: (i.first_release_date or _NO_DATE, i.id) for i in items}
     clusters: dict[int, list[int]] = {}
     for rid in parent:

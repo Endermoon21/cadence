@@ -310,3 +310,96 @@ def test_narrow_3_a_variant_label_alone_is_not_a_title_after_the_prefix():
     assert cluster_recordings([prefixed, deluxe]) == [[1], [3]]               # both would shrink to '[live]'
     song = alb(4, "night song [live]", albums=night, variant="live")
     assert cluster_recordings([song, alb(5, "song [live]", albums=night, variant="live")]) == [[4, 5]]
+
+
+# ---------------------------------------------------------------- remaster-year marker left in the title (R2)
+
+SMITHS = (("g:smiths", "the smiths"),)
+
+
+def test_r2_reel_around_the_fountain_with_and_without_the_year_marker_merges():
+    plain = alb(44516, "reel around the fountain", 359, SMITHS)
+    for marked in ("reel around the fountain 2011 remaster", "the smiths reel around the fountain 2011 remaster"):
+        rem = alb(44476, marked, 357, SMITHS)
+        assert cluster_recordings([rem, plain]) == [[44476, 44516]], marked
+        assert cluster_recordings([plain, rem]) == [[44476, 44516]], marked
+
+
+def test_r2_truncated_marker_box_of_rain_2013_remaste_merges_within_3_seconds():
+    rock = (("g:ab", "american beauty"),)
+    for dur, merged in ((300, True), (302, True), (303, True), (304, False), (297, True), (296, False)):
+        a = alb(1, "box of rain 2013 remaste", 300, rock)
+        b = alb(2, "box of rain", dur, rock)
+        assert (cluster_recordings([a, b]) == [[1, 2]]) is merged, dur
+
+
+def test_r2_the_marker_forms_are_recognised_and_only_a_remaster_year_is_stripped():
+    from cadence.identity.grouping import strip_remaster_year as strip
+    assert strip("box of rain (2013 remaster)") == "box of rain"
+    assert strip("box of rain (2013 Remastered)".lower()) == "box of rain"
+    assert strip("box of rain 2013 remastered") == "box of rain"
+    assert strip("box of rain 2013 remaste") == "box of rain"
+    assert strip("box of rain 2013 remaster") == "box of rain"
+    assert strip("box of rain (remastered 2013)") == "box of rain"          # a year in parentheses, 'remaster' anywhere
+    assert strip("box of rain (2013 stereo remaster) take 2") == "box of rain take 2"
+    assert strip("love 1985") == "love 1985"                                  # a bare year is a title, not a marker
+    assert strip("love 1985 remix") == "love 1985 remix"
+    assert strip("love (1985)") == "love (1985)"
+    assert strip("remastered 2013") == "remastered 2013"                      # nothing would be left
+    assert strip("2013 remaster") == "2013 remaster"
+    assert strip("box of rain") == "box of rain"
+
+
+def test_r2_a_bare_trailing_year_is_not_stripped_even_on_a_remaster():
+    rem = alb(1, "love 1985", 200)._replace(remaster=True, remaster_year=2011)
+    assert cluster_recordings([rem, alb(2, "love", 200)]) == [[1], [2]]
+    assert cluster_recordings([alb(1, "love 1985", 200), alb(2, "love", 200)]) == [[1], [2]]
+    assert cluster_recordings([alb(1, "love 1985", 200), alb(2, "love 1985", 202)]) == [[1, 2]]   # old rule: same title
+
+
+def test_r2_a_six_second_gap_does_not_merge():
+    a = alb(1, "so far away 2011 remaster", 306)
+    assert cluster_recordings([a, alb(2, "so far away", 312)]) == [[1], [2]]
+    assert cluster_recordings([a, alb(2, "so far away", 309)]) == [[1, 2]]       # 3 s: the grouping tolerance
+
+
+def test_r2_a_singleton_does_not_join_an_existing_multi_member_cluster():
+    cluster = [alb(2, "box of rain", 300), alb(3, "box of rain", 301)]            # old rule: [2, 3]
+    marked = alb(1, "box of rain 2013 remaste", 300)
+    assert cluster_recordings(cluster + [marked]) == [[1], [2, 3]]
+    assert cluster_recordings([marked] + cluster) == [[1], [2, 3]]
+    isrc = [alb(2, "box of rain", 300, isrc="X"), alb(3, "alt", 250, isrc="x")]   # a cluster by ISRC
+    assert cluster_recordings(isrc + [alb(4, "box of rain 2013 remaste", 300)]) == [[2, 3], [4]]
+
+
+def test_r2_both_durations_must_be_at_least_60_seconds():
+    for dur, merged in ((12, False), (59, False), (60, True), (61, True)):
+        pair = [alb(1, "intro 2011 remaster", dur), alb(2, "intro", dur)]
+        assert (cluster_recordings(pair) == [[1, 2]]) is merged, dur
+    assert cluster_recordings([alb(1, "intro 2011 remaster", 59), alb(2, "intro", 60)]) == [[1], [2]]
+    assert cluster_recordings([alb(1, "intro 2011 remaster", 60), alb(2, "intro", None)]) == [[1], [2]]
+
+
+def test_r2_needs_a_shared_album_group_and_keeps_live_and_studio_apart():
+    marked = alb(1, "song 2011 remaster", 200, (("g:a", "a"),))
+    assert cluster_recordings([marked, alb(2, "song", 200, (("g:b", "b"),))]) == [[1], [2]]
+    assert cluster_recordings([marked._replace(albums=frozenset(), groups=frozenset()), alb(2, "song", 200, (("g:a", "a"),))]) \
+        == [[1], [2]]                                                                 # no album data: no new path
+    live = alb(3, "song [live]", 200, (("g:a", "a"),), variant="live")
+    assert cluster_recordings([marked, live]) == [[1], [3]]
+    live_marked = alb(4, "song 2011 remaster [live]", 200, (("g:a", "a"),), variant="live")
+    assert cluster_recordings([live_marked, live]) == [[3], [4]]                      # the marker is not at the end: kept
+
+
+def test_r2_does_not_touch_the_album_prefix_pairs_or_their_one_second_tolerance():
+    assert cluster_recordings([alb(1, "night song", 241), alb(2, "song", 243)]) == [[1], [2]]    # still 1 s
+    assert cluster_recordings([alb(1, "night song", 241), alb(2, "song", 242)]) == [[1, 2]]
+    # a pair the prefix path already takes keeps its partner; the marked one waits for a free partner
+    items = [alb(1, "night song", 241), alb(2, "song", 242), alb(3, "song 2011 remaster", 241)]
+    assert cluster_recordings(items) == [[1, 2], [3]]
+    # 'song' x2 is a cluster of the old rule: the marked one may not join it
+    items = [alb(1, "song 2011 remaster", 241), alb(2, "song", 242), alb(3, "song", 243)]
+    assert cluster_recordings(items) == [[1], [2, 3]]
+    # a new cluster has exactly two members: the marked one takes the closest free partner (lowest id on a tie)
+    items = [alb(1, "song 2011 remaster", 241), alb(2, "song", 243), alb(3, "song", 250)]
+    assert cluster_recordings(items) == [[1, 2], [3]]
