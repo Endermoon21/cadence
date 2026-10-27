@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,12 +23,14 @@ from cadence.catalog.sync import _is_dead_connection, _named, _safe_message, _st
 from cadence.fetch.plan import FetchItem, Plan
 from cadence.fetch.stream import StreamInfo, StreamRefused, ext_for_quality, resolve_stream
 from cadence.gate.bucket import Gate, GatePaused
+from cadence.identity.normalize import norm_title
 from cadence.ledger import quality as quality_facts
 from cadence.ledger.db import log_event
 
 DEFAULT_QUALITY = "HI_RES_LOSSLESS"
 DURATION_TOLERANCE_S = 3
 MAX_NETWORK_FAILURES = 3
+MAX_EDITION_PROBES = 4  # other Tidal tracks of the same recording asked for per item when the planned one is served lossy
 HTTP_TIMEOUT = (10, 60)
 CHUNK = 1 << 20
 
@@ -320,6 +323,66 @@ def _staged(staging: Path, item: FetchItem, rel: str, ext: str) -> Path:
     return staging / p.with_name(f"{p.stem} [tidal {item.tidal_track_id}]{ext}")
 
 
+def _resolve(gate: Gate, session, tidal_id: int, quality: str) -> StreamInfo:
+    try:
+        return gate.call(resolve_stream, session, tidal_id, quality)
+    except (GatePaused, StreamRefused):
+        raise
+    except Exception as exc:
+        if _named(exc, "AuthenticationError") or _token_401(exc):
+            raise AuthStop(_safe_message(exc)) from exc
+        if 401 in _statuses(exc):
+            raise Blocked(_safe_message(exc)) from exc
+        raise
+
+
+def _same_length(planned_s: int | None, alt_s: int | None) -> bool:
+    """The alternate's ledger duration is within DURATION_TOLERANCE_S of the planned track's. Planned unknown: the
+    alternate's own is all there is, so it passes if it has one and fails if neither is known. Alternate unknown: nothing
+    to compare here; the downloaded file is checked against the planned duration afterwards."""
+    if planned_s is None:
+        return alt_s is not None
+    return alt_s is None or abs(alt_s - planned_s) <= DURATION_TOLERANCE_S
+
+
+def _probe_editions(conn: sqlite3.Connection, session, gate: Gate, item: FetchItem,
+                    quality: str) -> tuple[tuple[int, int | None, StreamInfo] | None, list[int]]:
+    """Tidal licenses lossless per release, so the planned track can be served lossy while another Tidal track of the
+    recording is served lossless. Candidates: same recording_id, same norm_title as the planned track (the same version,
+    not a live cut merged in by ISRC or length), a ledger duration within tolerance of the planned one, available, albums
+    first, then the lowest id. Asks for up to MAX_EDITION_PROBES of them, one resolve_stream each, and returns
+    (tidal id, its duration, stream) of the first lossless one, else None, with the ids tried. Every probe is logged and committed. A probe that fails is a lossy
+    probe, except a paused gate and a rejected login, which stop the run."""
+    want = norm_title(item.title)
+    cands = [(tid, dur) for tid, dur, title, version in conn.execute(
+        "SELECT t.tidal_id, t.duration_s, t.title, t.version FROM track t JOIN release rel ON rel.id = t.release_id "
+        "WHERE t.recording_id = ? AND t.tidal_id IS NOT NULL AND t.tidal_id != ? AND t.available IS NOT 0 "
+        "ORDER BY rel.type != 'album', t.tidal_id", (item.recording_id, item.tidal_track_id))
+        if norm_title(title, version) == want and _same_length(item.duration_s, dur)][:MAX_EDITION_PROBES]
+    tried: list[int] = []
+    for tid, dur in cands:
+        tried.append(tid)
+        stream = error = None
+        try:
+            stream = _resolve(gate, session, tid, quality)
+        except (GatePaused, AuthStop):
+            raise
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {_safe_message(exc)}"
+        lossless = stream is not None and not quality_facts.is_lossy(stream.codec)
+        served = stream.audio_quality if stream else None
+        log_event(conn, "fetch.edition_probe", item.target_rel,
+                  f"Planned Tidal track {item.tidal_track_id} of '{item.title}' by {item.artist} was served lossy; Tidal "
+                  f"track {tid} of the same recording: " + (f"{served} ({stream.codec})" if stream else error), {
+                      "planned_tidal_track_id": item.tidal_track_id, "tried_tidal_track_id": tid,
+                      "quality_requested": quality, "audio_quality": served, "codec": stream.codec if stream else None,
+                      "lossless": lossless, **({"error": error} if error else {})})
+        conn.commit()
+        if lossless:
+            return (tid, dur, stream), tried
+    return None, tried
+
+
 def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, library: Path, quality: str,
                verify: bool, ffmpeg: str | None) -> tuple[str, str]:
     """(status, note): status is 'placed', 'exists', 'conflict' (the target is taken by a file that is not this track's)
@@ -330,32 +393,34 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
     if taken := _taken(conn, library, item, rel):
         return taken
     held = _staged(staging, item, rel, ".m4a")  # where a lossy result for this track is held
-    if quality in ("LOSSLESS", "HI_RES_LOSSLESS") and os.path.lexists(held):
-        return "held_lossy", f"already held in staging, not fetched again: {held}"
-    try:
-        stream = gate.call(resolve_stream, session, item.tidal_track_id, quality)
-    except (GatePaused, StreamRefused):
-        raise
-    except Exception as exc:
-        if _named(exc, "AuthenticationError") or _token_401(exc):
-            raise AuthStop(_safe_message(exc)) from exc
-        if 401 in _statuses(exc):
-            raise Blocked(_safe_message(exc)) from exc
-        raise
+    already_held = quality in ("LOSSLESS", "HI_RES_LOSSLESS") and os.path.lexists(held)
+    stream = None if already_held else _resolve(gate, session, item.tidal_track_id, quality)  # a held track is not asked again
+    src, tried = item, []  # src: the Tidal track the bytes come from, the planned one unless another edition is lossless
+    if quality in ("LOSSLESS", "HI_RES_LOSSLESS") and (already_held or quality_facts.is_lossy(stream.codec)):
+        alt, tried = _probe_editions(conn, session, gate, item, quality)
+        if alt:
+            src = replace(item, tidal_track_id=alt[0], duration_s=alt[1] if item.duration_s is None else item.duration_s)
+            stream = alt[2]
+        elif already_held:  # no other edition is lossless: the held copy stays as it is
+            return "held_lossy", f"already held in staging, not fetched again: {held}"
     if stream.ext != Path(rel).suffix:
         rel = item.target(stream.ext)
         if taken := _taken(conn, library, item, rel):
             return taken
-    staged = _staged(staging, item, rel, stream.ext)
+    staged = _staged(staging, src, rel, stream.ext)
     staged.parent.mkdir(parents=True, exist_ok=True)
     part = staged.with_name(staged.name + ".part")
     if stream.segmented:
         gate.call(_download_segments, http, stream, part, ffmpeg)
     else:
         gate.call(_download_direct, http, stream.urls[0], part)
+    if verify:  # the new bytes are checked as the .part file, so a bad download never touches a staged or held copy
+        try:
+            _verify(part, ffmpeg, src.duration_s)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
     os.replace(part, staged)  # staging only; a leftover from an earlier failed try is overwritten
-    if verify:
-        _verify(staged, ffmpeg, item.duration_s)
     _tag(staged, item)
     facts = _file_facts(staged, stream)
     lossy, received = quality_facts.facts(facts["codec"], facts["sample_rate"], facts["bit_depth"], facts["bitrate"])
@@ -366,7 +431,7 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
                   f"{received or facts['codec']} but {quality} was requested", {
                       "tidal_track_id": item.tidal_track_id, "recording_id": item.recording_id, "path": rel,
                       "staged": str(staged), "quality_requested": quality, "quality_received": received,
-                      "audio_quality": stream.audio_quality})
+                      "audio_quality": stream.audio_quality, "alternates_tried": tried})
         conn.commit()
         return "held_lossy", note
     dest = library / rel
@@ -388,9 +453,10 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
     try:
         received = _insert_file(conn, item, rel, dest, facts, quality)
         log_event(conn, "fetch.placed", rel, f"Placed '{item.title}' by {item.artist} as {received or facts['codec']}",
-                  {"tidal_track_id": item.tidal_track_id, "recording_id": item.recording_id, "path": rel,
+                  {"tidal_track_id": src.tidal_track_id, "recording_id": item.recording_id, "path": rel,
                    "quality_requested": quality, "quality_received": received,
-                   "audio_quality": stream.audio_quality})
+                   "audio_quality": stream.audio_quality,
+                   **({"planned_tidal_track_id": item.tidal_track_id} if src is not item else {})})
         conn.commit()
     except sqlite3.Error as exc:
         conn.rollback()

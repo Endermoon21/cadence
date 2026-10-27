@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 
 import mutagen
@@ -1069,3 +1070,285 @@ def test_cli_paused_gate_after_the_plan_still_prints_the_skip_lines(cli_env, mon
     out = capsys.readouterr().out
     assert any(x.lstrip().startswith("skip ") and "no tidal id" in x for x in out.splitlines())
     assert out.index("no tidal id") < out.index("gate paused until")
+
+
+# ---- other Tidal tracks of the same recording, when the planned one is served lossy ----
+
+def seed_editions(alts, dur=4, alt_dur=4):
+    """Song 1 on Harvest (Tidal 1, the planned track) plus one more Tidal track of the same recording per (id, release
+    type) in `alts`, each on a later release of its own."""
+    conn = ledger()
+    a = add_artist(conn)
+    rec = add_recording(conn, a, "Song 1", isrc=ISRC)
+    add_track(conn, add_release(conn, a, "Harvest", 100), rec, 1, "Song 1", 1, dur=dur)
+    for n, (tid, kind) in enumerate(alts):
+        add_track(conn, add_release(conn, a, f"Harvest {n}", 200 + n, type=kind, date=f"2001-01-0{n + 1}"), rec, 1,
+                  "Song 1", tid, dur=alt_dur)
+    conn.commit()
+    return conn, a
+
+
+def lossy_body(tid):
+    return bts_body(url=AAC_URL.format(tid), codec="mp4a.40.2", audioQuality="HIGH", bitDepth=None)
+
+
+def asked(session):
+    return [int(path.split("/")[1]) for path, _ in session.calls]
+
+
+def probe_events(conn):
+    return [json.loads(e["data_json"]) for e in rows(conn, "event_log") if e["kind"] == "fetch.edition_probe"]
+
+
+def kinds(conn):
+    return [e["kind"] for e in rows(conn, "event_log")]
+
+
+@needs_ffmpeg
+def test_a_lossy_planned_track_is_replaced_by_a_lossless_edition_of_the_same_recording(flac, aac, dirs):
+    conn, a = seed_editions([(2, "album")])
+    stg, lib = dirs
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    http = FakeHttp({AAC_URL.format(1): aac, URL.format(2): flac})
+    res, _ = run(conn, session, http, dirs)
+    dest = lib / "Neil Young/Harvest/01 - Song 1.flac"  # the planned target, whatever edition the bytes came from
+    assert (res["placed"], res["held_lossy"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert dest.is_file() and not any(p.is_file() for p in stg.rglob("*"))
+    assert asked(session) == [1, 2] and http.urls == [URL.format(2)]  # the lossy planned stream was never downloaded
+    [f] = rows(conn)
+    assert (f["path"], f["codec"], f["lossy"], f["quality_requested"]) == \
+        ("Neil Young/Harvest/01 - Song 1.flac", "flac", 0, "LOSSLESS")
+    assert f["recording_id"] == conn.execute("SELECT id FROM recording WHERE title = 'Song 1'").fetchone()[0]
+    assert kinds(conn) == ["fetch.edition_probe", "fetch.placed"]
+    assert probe_events(conn) == [{"planned_tidal_track_id": 1, "tried_tidal_track_id": 2, "quality_requested": "LOSSLESS",
+                                   "audio_quality": "LOSSLESS", "codec": "flac", "lossless": True}]
+    placed = json.loads(rows(conn, "event_log")[1]["data_json"])
+    assert (placed["tidal_track_id"], placed["planned_tidal_track_id"], placed["path"]) == \
+        (2, 1, "Neil Young/Harvest/01 - Song 1.flac")
+
+
+@needs_ffmpeg
+def test_when_every_alternate_is_lossy_the_planned_track_is_held_as_before(aac, dirs):
+    conn, a = seed_editions([(2, "album"), (3, "single")])
+    stg, lib = dirs
+    session = FakeTidal({1: lossy_body(1), 2: lossy_body(2), 3: lossy_body(3)})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs)
+    assert (res["held_lossy"], res["placed"], res["failed"]) == (1, 0, 0)
+    assert (stg / f"{STAGED1}.m4a").is_file() and list(lib.iterdir()) == [] and rows(conn) == []
+    assert asked(session) == [1, 2, 3]
+    assert kinds(conn) == ["fetch.edition_probe", "fetch.edition_probe", "fetch.held_lossy"]
+    assert [(p["tried_tidal_track_id"], p["lossless"]) for p in probe_events(conn)] == [(2, False), (3, False)]
+    held = json.loads(rows(conn, "event_log")[2]["data_json"])
+    assert held["tidal_track_id"] == 1 and held["alternates_tried"] == [2, 3]
+
+
+@needs_ffmpeg
+def test_at_most_four_alternates_are_probed(aac, dirs):
+    conn, a = seed_editions([(n, "album") for n in range(2, 8)])  # six alternates, all lossy
+    session = FakeTidal({n: lossy_body(n) for n in range(1, 8)})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs)
+    assert (res["held_lossy"], res["placed"]) == (1, 0)
+    assert asked(session) == [1, 2, 3, 4, 5] and len(probe_events(conn)) == 4 == fetch_run.MAX_EDITION_PROBES
+    assert json.loads(rows(conn, "event_log")[-1]["data_json"])["alternates_tried"] == [2, 3, 4, 5]
+
+
+@needs_ffmpeg
+def test_only_the_first_lossless_alternate_is_probed(flac, aac, dirs):
+    conn, a = seed_editions([(2, "album"), (3, "album")])
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2)), 3: bts_body(url=URL.format(3))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac, URL.format(2): flac}), dirs)
+    assert (res["placed"], res["held_lossy"]) == (1, 0) and asked(session) == [1, 2]
+
+
+@needs_ffmpeg
+def test_albums_are_probed_first_then_the_lowest_tidal_id_and_unavailable_tracks_never(aac, dirs):
+    conn, a = seed_editions([(7, "single"), (3, "compilation"), (9, "album"), (5, "ep"), (2, "album")])
+    conn.execute("UPDATE track SET available = 0 WHERE tidal_id = 2")  # the lowest id, an album, but not playable
+    session = FakeTidal({n: lossy_body(n) for n in (1, 3, 5, 7, 9)})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs)
+    assert res["held_lossy"] == 1
+    assert asked(session) == [1, 9, 3, 5, 7]  # album 9 first; then 3, 5 (the cap of four stops before nothing else)
+
+
+@needs_ffmpeg
+def test_a_track_of_another_recording_is_never_tried(aac, dirs):
+    conn, a = seed_editions([])
+    other = add_recording(conn, a, "Song 9", isrc=f"{ISRC[:-1]}9")
+    add_track(conn, add_release(conn, a, "Other", 300), other, 1, "Song 9", 9)
+    conn.commit()
+    items = [i for i in plan_missing(conn, scope="all").items if i.tidal_track_id == 1]
+    session = FakeTidal({1: lossy_body(1), 9: bts_body(url=URL.format(9))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs, items=items)
+    assert res["held_lossy"] == 1 and asked(session) == [1] and probe_events(conn) == []
+
+
+@needs_ffmpeg
+def test_a_high_request_does_not_look_for_another_edition(aac, dirs):
+    conn, a = seed_editions([(2, "album")])
+    stg, lib = dirs
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs, quality="HIGH")
+    assert (res["placed"], res["held_lossy"]) == (1, 0) and asked(session) == [1]
+    assert (lib / "Neil Young/Harvest/01 - Song 1.m4a").is_file() and probe_events(conn) == []
+
+
+def held_copy(stg):
+    held = stg / f"{STAGED1}.m4a"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(b"held")
+    return held
+
+
+@needs_ffmpeg
+def test_a_held_track_gets_the_edition_fallback_without_asking_for_the_planned_track_again(flac, dirs, monkeypatch):
+    conn, a = seed_editions([(2, "album")])
+    stg, lib = dirs
+    held = held_copy(stg)
+    seen = []
+    real = fetch_run.log_event
+    def spy(conn_, kind, *args, **kw):  # what the world looks like when each event is written
+        seen.append((kind, held.exists(), len(rows(conn_))))
+        return real(conn_, kind, *args, **kw)
+    monkeypatch.setattr(fetch_run, "log_event", spy)
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    res, _ = run(conn, session, FakeHttp({URL.format(2): flac}), dirs)
+    assert (res["placed"], res["held_lossy"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert asked(session) == [2]  # the planned id 1 is not asked, only the alternate
+    assert (lib / "Neil Young/Harvest/01 - Song 1.flac").is_file() and not held.exists()
+    assert not any(p.is_file() for p in stg.rglob("*"))
+    assert kinds(conn) == ["fetch.edition_probe", "fetch.placed", "fetch.stale_held_removed"]
+    # the held copy is still there while the file row and the placed event are written; it goes only after both
+    assert seen == [("fetch.edition_probe", True, 0), ("fetch.placed", True, 1), ("fetch.stale_held_removed", False, 1)]
+    placed = json.loads(rows(conn, "event_log")[1]["data_json"])
+    assert (placed["tidal_track_id"], placed["planned_tidal_track_id"]) == (2, 1)
+    assert [f["path"] for f in rows(conn)] == ["Neil Young/Harvest/01 - Song 1.flac"]
+
+
+def test_a_held_track_whose_alternates_are_all_lossy_keeps_its_held_copy(dirs):
+    conn, a = seed_editions([(2, "album"), (3, "single")])
+    stg, lib = dirs
+    held = held_copy(stg)
+    session, http = FakeTidal({1: lossy_body(1), 2: lossy_body(2), 3: lossy_body(3)}), FakeHttp()
+    res, out = run(conn, session, http, dirs)
+    assert (res["held_lossy"], res["placed"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert asked(session) == [2, 3] and http.urls == []
+    assert held.read_bytes() == b"held" and [p for p in stg.rglob("*") if p.is_file()] == [held]
+    assert rows(conn) == [] and list(lib.iterdir()) == []
+    assert kinds(conn) == ["fetch.edition_probe", "fetch.edition_probe"]
+    assert [(p["tried_tidal_track_id"], p["lossless"]) for p in probe_events(conn)] == [(2, False), (3, False)]
+    assert "held_lossy" in "\n".join(out) and str(held) in "\n".join(out)
+
+
+def test_a_held_track_with_no_other_edition_is_skipped_without_a_probe(dirs):
+    conn, a = seed_editions([])
+    stg, lib = dirs
+    held = held_copy(stg)
+    session, http = FakeTidal({1: lossy_body(1)}), FakeHttp()
+    res, _ = run(conn, session, http, dirs)
+    assert (res["held_lossy"], res["placed"], res["failed"], res["stopped"]) == (1, 0, 0, None)
+    assert session.calls == [] and http.urls == [] and held.read_bytes() == b"held"
+    assert rows(conn) == [] and rows(conn, "event_log") == [] and list(lib.iterdir()) == []
+
+
+@needs_ffmpeg
+def test_a_held_track_under_a_high_request_never_probes_other_editions(aac, dirs):
+    conn, a = seed_editions([(2, "album")])
+    stg, lib = dirs
+    held = held_copy(stg)
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs, quality="HIGH")  # unchanged: HIGH fetches as before
+    assert (res["placed"], res["held_lossy"], res["failed"]) == (1, 0, 0)
+    assert asked(session) == [1] and probe_events(conn) == [] and held.exists() is False
+
+
+@needs_ffmpeg
+def test_the_held_copy_survives_when_placing_the_alternate_fails(flac, dirs):
+    conn, a = seed_editions([(2, "album")], dur=300, alt_dur=None)  # the 4 s alternate fails the planned 300 s check
+    conn.execute("UPDATE recording SET duration_s = 300")
+    stg, lib = dirs
+    held = held_copy(stg)
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    res, _ = run(conn, session, FakeHttp({URL.format(2): flac}), dirs)
+    assert (res["placed"], res["failed"], res["held_lossy"]) == (0, 1, 0) and asked(session) == [2]
+    assert held.read_bytes() == b"held" and rows(conn) == [] and list(lib.iterdir()) == []
+    assert kinds(conn) == ["fetch.edition_probe", "fetch.failed"]
+
+
+@needs_ffmpeg
+def test_a_bad_download_is_verified_before_it_can_replace_a_held_copy(dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    held = held_copy(stg)
+    res, out = run(conn, aac_tidal(), FakeHttp({AAC_URL.format(1): b"not audio at all"}), dirs, quality="HIGH")
+    assert (res["placed"], res["failed"], res["held_lossy"]) == (0, 1, 0)
+    assert held.read_bytes() == b"held" and [p for p in stg.rglob("*") if p.is_file()] == [held]  # no .part left
+    assert rows(conn) == [] and list(lib.iterdir()) == [] and "decode check failed" in "\n".join(out)
+
+
+@needs_ffmpeg
+def test_a_failed_verify_leaves_neither_a_part_file_nor_a_staged_file(dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    res, _ = run(conn, aac_tidal(), FakeHttp({AAC_URL.format(1): b"not audio at all"}), dirs)
+    assert (res["placed"], res["failed"], res["held_lossy"]) == (0, 1, 0)
+    assert not any(p.is_file() for p in stg.rglob("*")) and rows(conn) == []
+
+
+@needs_ffmpeg
+def test_an_alternate_that_errors_is_logged_and_the_next_one_is_tried(flac, aac, dirs):
+    conn, a = seed_editions([(2, "album"), (3, "album")])
+    session = FakeTidal({1: lossy_body(1), 2: http_error(401), 3: bts_body(url=URL.format(3))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac, URL.format(3): flac}), dirs)
+    assert (res["placed"], res["blocked"], res["failed"]) == (1, 0, 0) and asked(session) == [1, 2, 3]
+    first, second = probe_events(conn)
+    assert first["tried_tidal_track_id"] == 2 and first["lossless"] is False and "error" in first
+    assert second["tried_tidal_track_id"] == 3 and second["lossless"] is True
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("planned_dur, alt_dur, outcome", [  # (placed, failed, held_lossy); the file is 4 s
+    (4, 4, (1, 0, 0)), (4, None, (1, 0, 0)), (None, 4, (1, 0, 0)),  # NULL planned: the alternate's own duration is used
+    (300, None, (0, 1, 0)),  # no ledger duration to compare: the downloaded file is checked against the planned one
+    (300, 4, (0, 1, 0)),  # alternate refused unprobed; the lossy planned file (4 s) then fails its own 300 s check, as before
+    (4, 300, (0, 0, 1)), (4, 156, (0, 0, 1)), (None, None, (0, 0, 1))])  # alternate refused, nothing probed
+def test_the_alternate_must_match_the_planned_tracks_duration(flac, aac, dirs, planned_dur, alt_dur, outcome):
+    conn, a = seed_editions([(2, "album")], dur=planned_dur, alt_dur=alt_dur)
+    conn.execute("UPDATE recording SET duration_s = ?", (planned_dur,))  # the plan falls back to the recording's duration
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac, URL.format(2): flac}), dirs)
+    assert (res["placed"], res["failed"], res["held_lossy"]) == outcome and len(rows(conn)) == outcome[0]
+    assert asked(session) == ([1, 2] if outcome[0] or (planned_dur, alt_dur) == (300, None) else [1])
+
+
+@needs_ffmpeg
+def test_an_alternate_of_another_length_is_skipped_and_the_next_one_is_tried(flac, aac, dirs):
+    conn, a = seed_editions([(2, "album"), (3, "album")])
+    conn.execute("UPDATE track SET duration_s = 156 WHERE tidal_id = 2")
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2)), 3: bts_body(url=URL.format(3))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac, URL.format(3): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (1, 0) and asked(session) == [1, 3]
+
+
+@needs_ffmpeg
+def test_another_version_on_the_same_recording_is_never_probed_but_the_same_title_elsewhere_is(flac, aac, dirs):
+    conn, a = seed_editions([(5, "album")])  # tidal 5: "Song 1" on another album
+    rec = conn.execute("SELECT id FROM recording").fetchone()[0]
+    live = add_release(conn, a, "Live", 300, type="album", date="2000-01-01")
+    add_track(conn, live, rec, 1, "Song 1 (Live from Brooklyn)", 3)  # same recording and length, lower id: it would be probed first
+    conn.commit()
+    session = FakeTidal({1: lossy_body(1), 5: lossy_body(5), 3: bts_body(url=URL.format(3))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac}), dirs)
+    assert (res["held_lossy"], res["placed"]) == (1, 0) and asked(session) == [1, 5]  # 3 is the live cut: never asked
+    assert [p["tried_tidal_track_id"] for p in probe_events(conn)] == [5]
+
+
+@needs_ffmpeg
+def test_a_remaster_marked_title_is_the_same_version(flac, aac, dirs):
+    conn, a = seed_editions([])
+    rec = conn.execute("SELECT id FROM recording").fetchone()[0]
+    add_track(conn, add_release(conn, a, "Remastered", 300, type="album", date="2009-01-01"), rec, 1,
+              "Song 1 (2009 Remaster)", 2)
+    conn.commit()
+    session = FakeTidal({1: lossy_body(1), 2: bts_body(url=URL.format(2))})
+    res, _ = run(conn, session, FakeHttp({AAC_URL.format(1): aac, URL.format(2): flac}), dirs)
+    assert (res["placed"], res["failed"]) == (1, 0) and asked(session) == [1, 2]
