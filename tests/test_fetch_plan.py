@@ -146,6 +146,52 @@ def test_default_scope_is_partial_only():
     assert explicit.title == "Nobody Home"  # asking for a release by id is explicit
 
 
+def boxed():
+    """Album (Song owned, Other missing) and a box set whose "Song (box)" is in Song's cluster but has no file of its
+    own, plus two box-only tracks. Returns conn, artist, album, box."""
+    conn = ledger()
+    a = add_artist(conn)
+    album = add_release(conn, a, "Album", 1, date="1970-01-01")
+    box = add_release(conn, a, "Complete Box", 2, date="2010-01-01")
+    song = add_recording(conn, a, "Song")
+    boxed_song = add_recording(conn, a, "Song (box)", canon_id=song)
+    conn.execute("UPDATE recording SET canon_id = ? WHERE id = ?", (song, song))
+    add_track(conn, album, song, 1, "Song", 11)
+    add_track(conn, album, add_recording(conn, a, "Other"), 2, "Other", 12)
+    add_track(conn, box, boxed_song, 1, "Song", 21)
+    add_track(conn, box, add_recording(conn, a, "Box One"), 2, "Box One", 22)
+    add_track(conn, box, add_recording(conn, a, "Box Two"), 3, "Box Two", 23)
+    add_file(conn, "Neil Young/Album/01 - Song.flac", a, song)  # linked to the album's recording, not the box's
+    return conn, a, album, box
+
+
+def test_a_release_whose_only_owned_track_is_a_cluster_member_is_not_partially_included():
+    conn, a, album, box = boxed()
+    plan = plan_missing(conn)
+    assert titles(plan.items) == ["Other"] and plan.owned == 1
+    assert {s.title: s.reason for s in plan.skipped} == {"Box One": R_PARTIAL, "Box Two": R_PARTIAL}
+
+
+def test_a_release_with_a_file_linked_to_one_of_its_own_tracks_is_partially_included():
+    conn, a, album, box = boxed()
+    add_file(conn, "Neil Young/Complete Box/02 - Box One.flac", a, conn.execute(
+        "SELECT recording_id FROM track WHERE tidal_id = 22").fetchone()[0])
+    assert titles(plan_missing(conn).items) == ["Other", "Box Two"]
+
+
+def test_the_owned_cluster_member_on_the_box_is_owned_not_planned_under_any_scope():
+    conn, a, album, box = boxed()
+    for kw in (dict(), dict(scope="all"), dict(release_id=box), dict(release_id=album)):
+        plan = plan_missing(conn, **kw)
+        assert plan.owned == 1 and "Song" not in titles(plan.items) + [s.title for s in plan.skipped], kw
+
+
+def test_scope_all_and_a_release_filter_still_plan_the_missing_tracks_of_the_box():
+    conn, a, album, box = boxed()
+    assert titles(plan_missing(conn, scope="all").items) == ["Other", "Box One", "Box Two"]
+    assert titles(plan_missing(conn, release_id=box).items) == ["Box One", "Box Two"]
+
+
 def test_the_album_folder_comes_from_the_release_title_not_from_library_folders():
     conn, a = scoped()
     [i] = plan_missing(conn).items

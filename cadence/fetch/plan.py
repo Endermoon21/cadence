@@ -14,8 +14,9 @@ Every recording cluster of the artist ends up in exactly one bucket of the retur
 editions carry it, but `owned` is counted per artist that carries the cluster, not per cluster. One shared by several artists is planned under one only (the recording row's artist, else the first);
 the others skip it with R_SHARED.
 
-Scope (default 'partial'): only release groups where something is already owned. The album folder is the release
-title without remaster/edition markers."""
+Scope (default 'partial'): only release groups where something is already owned: a linked file whose recording is
+itself a track of the release (not merely in the same cluster as one, which would pull in a box set). The album
+folder is the release title without remaster/edition markers."""
 from __future__ import annotations
 
 import sqlite3
@@ -191,6 +192,7 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
     if scope not in ("partial", "all"):
         raise ValueError("scope must be 'partial' or 'all'")
     owned = _owned_clusters(conn)
+    linked_recs = {r[0] for r in conn.execute("SELECT DISTINCT recording_id FROM file WHERE recording_id IS NOT NULL")}
     only: set[int] | None = None
     if release_id is not None:
         rel = conn.execute("SELECT artist_id FROM release WHERE id = ?", (release_id,)).fetchone()
@@ -217,7 +219,7 @@ def plan_missing(conn: sqlite3.Connection, artist_id: int | None = None, release
         by_cluster: dict[int, list] = {}
         for r in rows:
             by_cluster.setdefault(r["cid"], []).append(r)
-        partial = {r["gk"] for r in rows if visible(r) and r["cid"] in owned}  # release groups with an owned track
+        partial = {r["gk"] for r in rows if visible(r) and r["rec_id"] in linked_recs}  # groups with a linked own track
         picked: list[tuple] = []  # (row, FetchItem | Skip), sorted below by the row
 
         def skip(rs: list, reason: str) -> None:
