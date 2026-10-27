@@ -192,3 +192,59 @@ def test_live_recordings_cluster_only_within_one_release_group():
              for r in conn.execute("SELECT isrc, canon_id FROM recording")}
     assert canon == {"L1": "L3", "L3": "L3", "L2": "L2"}     # same concert's remaster merges (and leads), the other show not
     assert report.artist_report(conn, aid)["missing_variant"] == 2
+
+
+# ---------------------------------------------------------------- album-prefixed titles
+
+def prefixed_setup(deluxe_date="1980-11-01"):
+    """Night (1980) has 'Night - Alpha'; its deluxe has plain 'Alpha' (other ISRC, same length); Day is another album;
+    the two 'Gamma' singles show the prefix is only an album thing."""
+    return will_setup(
+        [rel(10, "Night", [WILL], "album", "1980-01-01"), rel(11, "Night (Deluxe)", [WILL], "album", deluxe_date),
+         rel(12, "Day", [WILL], "album", "1990-01-01"),
+         rel(13, "Gamma", [WILL], "single", "2000-01-01"), rel(14, "Gamma", [WILL], "single", "2001-01-01")],
+        {10: [trk(100, "Night - Alpha", 200, "I1", 1), trk(101, "Beta", 180, "I2", 2)],
+         11: [trk(110, "Alpha", 200, "K1", 1), trk(111, "Beta", 180, "K2", 2)],
+         12: [trk(120, "Night - Alpha", 215, "D1", 1)],
+         13: [trk(130, "Gamma - Reprise", 100, "G1")], 14: [trk(140, "Reprise", 100, "G2")]})
+
+
+def canon_by_isrc(conn):
+    return {r["isrc"]: conn.execute("SELECT isrc FROM recording WHERE id = ?", (r["canon_id"],)).fetchone()[0]
+            for r in conn.execute("SELECT isrc, canon_id FROM recording")}
+
+
+def test_regroup_merges_the_album_prefixed_pair_and_leaves_the_others_unchanged():
+    conn, aid, cat = prefixed_setup()
+    sync_artist(conn, cat, row(conn, aid))
+    ids = {r["isrc"]: r["id"] for r in conn.execute("SELECT id, isrc FROM recording")}
+    conn.execute("UPDATE recording SET canon_id = id")                   # the ledger as the old rule left it:
+    conn.execute("UPDATE recording SET canon_id = ? WHERE id = ?", (ids["I2"], ids["K2"]))   # only 'Beta' merged
+    conn.commit()
+    before = dict(tuple(r) for r in conn.execute("SELECT id, canon_id FROM recording"))
+    stats = regroup_artist(conn, aid)
+    after = dict(tuple(r) for r in conn.execute("SELECT id, canon_id FROM recording"))
+    assert [i for i in before if before[i] != after[i]] == [ids["K1"]]   # only the plain 'Alpha' moved
+    assert canon_by_isrc(conn) == {"I1": "I1", "K1": "I1",              # prefixed + plain, ISRCs differ: merged
+                                   "I2": "I2", "K2": "I2",              # plain duplicates: merged as before
+                                   "D1": "D1",                          # same title, other album, 15 s apart
+                                   "G1": "G1", "G2": "G2"}              # singles never give a prefix
+    assert (stats["recordings"], stats["clusters"]) == (7, 5)
+
+
+def test_prefixed_regroup_is_idempotent_and_deletes_nothing():
+    conn, aid, cat = prefixed_setup()
+    sync_artist(conn, cat, row(conn, aid))
+    first = snapshot(conn)
+    counts = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("release", "recording", "track")]
+    assert regroup_artist(conn, aid)["clusters"] == regroup_all(conn)["clusters"] == 5
+    assert snapshot(conn) == first
+    assert counts == [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("release", "recording", "track")]
+
+
+def test_prefixed_pair_on_albums_of_different_or_unknown_years_stays_apart():
+    for date in ("2019-01-01", None):
+        conn, aid, cat = prefixed_setup(date)
+        sync_artist(conn, cat, row(conn, aid))
+        assert canon_by_isrc(conn)["K1"] == "K1", date                # 'Night - Alpha' (1980) vs plain 'Alpha' (2019 / no date)
+        assert canon_by_isrc(conn)["I2"] == "I2" and canon_by_isrc(conn)["K2"] == "I2"   # old rule untouched

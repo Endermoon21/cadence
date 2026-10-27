@@ -28,6 +28,18 @@ def _release_groups(conn: sqlite3.Connection, artist_id: int) -> dict[int, set[s
     return out
 
 
+def _albums(conn: sqlite3.Connection, artist_id: int) -> dict[int, set[tuple[str, str, int | None]]]:
+    """(group key as in _release_groups, release norm_title, release year) of the ALBUM releases each recording is on."""
+    out: dict[int, set[tuple[str, str, int | None]]] = {}
+    for r in conn.execute(
+            "SELECT t.recording_id, rel.artist_id || ':' || COALESCE(rel.group_key, 'release:' || rel.id) AS gk, "
+            "rel.norm_title, rel.release_date FROM track t JOIN release rel ON rel.id = t.release_id "
+            "WHERE rel.type = 'album' AND t.recording_id IN (SELECT id FROM recording WHERE artist_id = ?)",
+            (artist_id,)):
+        out.setdefault(r["recording_id"], set()).add((r["gk"], r["norm_title"], date_year(r["release_date"])))
+    return out
+
+
 def _remasters(conn: sqlite3.Connection, artist_id: int) -> dict[int, tuple[int | None, str | None]]:
     """recording id -> (remaster year, earliest remaster release date), for the recordings that are remasters.
 
@@ -64,9 +76,11 @@ def _remasters(conn: sqlite3.Connection, artist_id: int) -> dict[int, tuple[int 
 def _regroup_recordings(conn: sqlite3.Connection, artist_id: int) -> tuple[int, int]:
     groups = _release_groups(conn, artist_id)
     remasters = _remasters(conn, artist_id)
+    albums = _albums(conn, artist_id)
     items = [RecordingItem(r["id"], r["norm_title"], r["duration_s"], r["isrc"], r["first_date"], r["variant"],
                            frozenset(groups.get(r["id"], ())), r["id"] in remasters,
-                           remasters.get(r["id"], (None, None))[1], remasters.get(r["id"], (None, None))[0])
+                           remasters.get(r["id"], (None, None))[1], remasters.get(r["id"], (None, None))[0],
+                           frozenset(albums.get(r["id"], ())))
              for r in conn.execute(
         "SELECT rec.id, rec.norm_title, rec.duration_s, rec.isrc, rec.variant, "
         "(SELECT MIN(rel.release_date) FROM track t JOIN release rel ON rel.id = t.release_id "
