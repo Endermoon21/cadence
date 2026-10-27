@@ -58,6 +58,38 @@ def _exists(conn: sqlite3.Connection, library_root: Path, rel: str) -> bool:
     return os.path.lexists(library_root / rel) or _in_ledger(conn, rel)
 
 
+def _occupied(conn: sqlite3.Connection, library_root: Path, item: FetchItem, rel: str) -> str | None:
+    """None when `rel` is free. 'exists' when the ledger links this track's cluster to it, else 'conflict': something
+    else holds the path, so the track is not in the library and is not fetched under another name."""
+    if not _exists(conn, library_root, rel):
+        return None
+    linked = conn.execute("SELECT 1 FROM file f JOIN recording r ON r.id = f.recording_id WHERE f.path = ? AND "
+                          "COALESCE(r.canon_id, r.id) = (SELECT COALESCE(canon_id, id) FROM recording WHERE id = ?)",
+                          (rel, item.recording_id)).fetchone()
+    return "exists" if linked else "conflict"
+
+
+def _taken(conn: sqlite3.Connection, library_root: Path, item: FetchItem, rel: str,
+           staged: Path | None = None) -> tuple[str, str] | None:
+    """`staged` is the verified download when the path was found taken only after it: that copy is kept, and said so."""
+    state = _occupied(conn, library_root, item, rel)
+    if state == "conflict":
+        data = {"tidal_track_id": item.tidal_track_id, "recording_id": item.recording_id, "path": rel}
+        if staged is None:
+            msg = (f"Not fetched: '{item.title}' by {item.artist} has no file of its own, "
+                   f"but {rel} is taken by a file the ledger does not link to it")
+            note = "target path is occupied by an unlinked file; nothing fetched"
+        else:
+            data["staged"] = str(staged)
+            msg = (f"Downloaded and verified '{item.title}' by {item.artist}, but {rel} became occupied by a file the "
+                   f"ledger does not link to it; the copy is kept in staging at {staged}")
+            note = f"downloaded and verified, but the target path became occupied; copy kept in staging at {staged}"
+        log_event(conn, "fetch.conflict", rel, msg, data)
+        conn.commit()
+        return state, note
+    return (state, "") if state else None
+
+
 def _token_401(exc: BaseException) -> bool:
     """A 401 whose body says the token/session is the problem (as opposed to this one asset)."""
     seen: set[int] = set()
@@ -290,13 +322,13 @@ def _staged(staging: Path, item: FetchItem, rel: str, ext: str) -> Path:
 
 def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, library: Path, quality: str,
                verify: bool, ffmpeg: str | None) -> tuple[str, str]:
-    """(status, note): status is 'placed', 'exists' or 'held_lossy' (a lossy file stays in staging unless HIGH was
-    requested). Raises GatePaused, AuthStop, Blocked, FetchError or StreamRefused."""
+    """(status, note): status is 'placed', 'exists', 'conflict' (the target is taken by a file that is not this track's)
+    or 'held_lossy' (a lossy file stays in staging unless HIGH was requested). Raises GatePaused, AuthStop, Blocked, FetchError or StreamRefused."""
     rel = item.target_rel
     if not _safe_rel(rel):
         raise FetchError(f"unsafe target path '{rel}'")
-    if _exists(conn, library, rel):
-        return "exists", ""
+    if taken := _taken(conn, library, item, rel):
+        return taken
     held = _staged(staging, item, rel, ".m4a")  # where a lossy result for this track is held
     if quality in ("LOSSLESS", "HI_RES_LOSSLESS") and os.path.lexists(held):
         return "held_lossy", f"already held in staging, not fetched again: {held}"
@@ -312,8 +344,8 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
         raise
     if stream.ext != Path(rel).suffix:
         rel = item.target(stream.ext)
-        if _exists(conn, library, rel):
-            return "exists", ""
+        if taken := _taken(conn, library, item, rel):
+            return taken
     staged = _staged(staging, item, rel, stream.ext)
     staged.parent.mkdir(parents=True, exist_ok=True)
     part = staged.with_name(staged.name + ".part")
@@ -338,18 +370,20 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
         conn.commit()
         return "held_lossy", note
     dest = library / rel
-    if os.path.lexists(dest):
-        return "exists", ""
+    if taken := _taken(conn, library, item, rel, staged):
+        return taken
     new_dirs = [d for d in (dest.parent, *dest.parent.parents) if not os.path.lexists(d)]  # deepest first
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         _move_into_library(staged, dest)
-    except BaseException:
+    except BaseException as exc:
         for d in new_dirs:  # only directories this call created, and only while empty
             try:
                 d.rmdir()
             except OSError:
                 break
+        if isinstance(exc, FileExistsError) and (taken := _taken(conn, library, item, rel, staged)):
+            return taken  # the path was taken after the check above: the staged copy stays, and the conflict names it
         raise
     try:
         received = _insert_file(conn, item, rel, dest, facts, quality)
@@ -384,7 +418,7 @@ def _fetch_one(conn, session, gate: Gate, http, item: FetchItem, staging: Path, 
 # ---- the run ----
 
 def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out, skipped) -> dict:
-    res = {"dry_run": True, "would_fetch": 0, "exists": 0, "skipped_dest": 0, "placed": 0, "held_lossy": 0,
+    res = {"dry_run": True, "would_fetch": 0, "exists": 0, "conflict": 0, "skipped_dest": 0, "placed": 0, "held_lossy": 0,
            "blocked": 0, "failed": 0, "owned_elsewhere": len(skipped), "stopped": None, "until": None, "remaining": []}
     ext = ext_for_quality(quality)
     out(f"fetch (dry run, quality {quality}): {len(items)} item(s); nothing is downloaded or written. "
@@ -393,15 +427,15 @@ def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out
         rel = it.target(ext)
         if it.dest == "fiio":
             state, key = "skip (fiio-only)", "skipped_dest"
-        elif _exists(conn, library_root, rel):
-            state, key = "exists, skip", "exists"
+        elif taken := _occupied(conn, library_root, it, rel):
+            state, key = ("exists, skip" if taken == "exists" else "conflict"), taken
         else:
             state, key = "would fetch", "would_fetch"
         res[key] += 1
         out(f"  {state:<16} {rel}  [tidal {it.tidal_track_id}, {_fmt_dur(it.duration_s)}, dest {it.dest}]")
     for it, owned_path in skipped:
         out(f"  {'owned elsewhere':<16} {it.target_rel}  (owned under another title: {owned_path})")
-    out(f"fetch: {res['would_fetch']} would be fetched, {res['exists']} already exist, "
+    out(f"fetch: {res['would_fetch']} would be fetched, {res['exists']} already exist, {res['conflict']} conflict, "
         f"{res['skipped_dest']} fiio-only skipped, {len(skipped)} owned under another title")
     return res
 
@@ -409,7 +443,7 @@ def _dry_run(conn, items: list[FetchItem], library_root: Path, quality: str, out
 def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: list[FetchItem], staging_dir,
                 library_root, dry_run: bool = True, quality: str = DEFAULT_QUALITY, verify: bool = True, *,
                 http=None, ffmpeg: str | None = None, out=print, skipped: list | None = None) -> dict:
-    """Result keys: placed, exists, held_lossy, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
+    """Result keys: placed, exists, conflict, held_lossy, blocked, failed, skipped_dest, stopped (None | paused | auth | network |
     setup), until, remaining (items not attempted, including the one a stop happened on)."""
     library_root = Path(library_root)
     skipped = skipped or []  # (item, owned path) pairs the planner left out as owned under another title
@@ -417,7 +451,7 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
         return _dry_run(conn, items, library_root, quality, out, skipped)
     staging_dir = Path(staging_dir)
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
-    res = {"dry_run": False, "placed": 0, "exists": 0, "held_lossy": 0, "blocked": 0, "failed": 0,
+    res = {"dry_run": False, "placed": 0, "exists": 0, "conflict": 0, "held_lossy": 0, "blocked": 0, "failed": 0,
            "skipped_dest": 0, "stopped": None, "until": None, "remaining": []}
     problem = _preflight(staging_dir, library_root, verify, ffmpeg)
     if problem:
@@ -469,10 +503,13 @@ def fetch_items(conn: sqlite3.Connection, session, gate: Gate | None, items: lis
             if network_failures >= MAX_NETWORK_FAILURES:
                 res.update(stopped="network", remaining=list(items[i + 1:]))
                 break
-    out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['held_lossy']} held (lossy), "
+    out(f"fetch: {res['placed']} placed, {res['exists']} already existed, {res['conflict']} conflict, "
+        f"{res['held_lossy']} held (lossy), "
         f"{res['blocked']} blocked, "
         f"{res['failed']} failed, {len(res['remaining'])} not attempted, {len(skipped)} owned under another title, "
         f"stopped={res['stopped']}")
+    for it, owned_path in skipped:
+        out(f"  {'owned elsewhere':<16} {it.target_rel}  (owned under another title: {owned_path})")
     for it in res["remaining"]:
         out(f"  remaining {it.target_rel}")
     return res

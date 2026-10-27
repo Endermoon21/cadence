@@ -334,7 +334,7 @@ def test_a_library_file_that_appears_during_the_cross_device_copy_is_not_replace
         dest.write_bytes(b"precious")  # someone else puts the file there while we copy
     monkeypatch.setattr(fetch_run.shutil, "copy2", copy_then_race)
     res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
-    assert (res["placed"], res["failed"]) == (0, 1)
+    assert (res["placed"], res["conflict"], res["failed"]) == (0, 1, 0)
     assert dest.read_bytes() == b"precious" and not list(lib.rglob("*.part"))
     assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
 
@@ -362,7 +362,7 @@ def test_a_library_file_that_appears_just_before_the_link_is_not_replaced(flac, 
     dest = lib / "Neil Young/Harvest/01 - Song 1.flac"
     link_hook(monkeypatch, lib, before=lambda dst: dest.write_bytes(b"precious"))  # lands after every lexists check
     res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
-    assert (res["placed"], res["failed"]) == (0, 1)
+    assert (res["placed"], res["conflict"], res["failed"]) == (0, 1, 0)
     assert dest.read_bytes() == b"precious" and not list(lib.rglob("*.part"))
     assert (stg / f"{STAGED1}.flac").is_file() and rows(conn) == []
 
@@ -428,7 +428,7 @@ def test_staging_with_a_different_letter_case_than_the_library_is_refused(tmp_pa
     assert session.calls == [] and http.urls == [] and list(lib.iterdir()) == []
 
 
-def test_a_dangling_symlink_at_the_destination_counts_as_existing_and_is_not_replaced(dirs):
+def test_a_dangling_symlink_at_the_destination_is_a_conflict_and_is_not_replaced(dirs):
     conn, a = seed(1)
     stg, lib = dirs
     target = lib / "Neil Young/Harvest/01 - Song 1.flac"
@@ -436,7 +436,7 @@ def test_a_dangling_symlink_at_the_destination_counts_as_existing_and_is_not_rep
     target.symlink_to(lib / "nowhere.flac")  # dangling
     session, http = tidal(1), FakeHttp()
     res, out = run(conn, session, http, dirs)
-    assert (res["placed"], res["exists"]) == (0, 1)
+    assert (res["placed"], res["exists"], res["conflict"]) == (0, 0, 1)
     assert target.is_symlink() and not target.exists() and os.readlink(target) == str(lib / "nowhere.flac")
     assert session.calls == [] and http.urls == [] and rows(conn) == []
 
@@ -460,10 +460,38 @@ def test_never_overwrites_a_file_on_disk_or_in_the_ledger(flac, dirs):
     add_file(conn, "Neil Young/Harvest/02 - Song 2.flac", a)  # known to the ledger only
     session, http = tidal(2), FakeHttp({URL.format(1): flac, URL.format(2): flac})
     res, out = run(conn, session, http, dirs)
-    assert (res["placed"], res["exists"]) == (0, 2)
+    assert (res["placed"], res["exists"], res["conflict"]) == (0, 0, 2)  # neither path is linked to its track
     assert target.read_bytes() == b"precious" and not (lib / "Neil Young/Harvest/02 - Song 2.flac").exists()
     assert session.calls == [] and http.urls == []  # decided before any Tidal call
     assert len(rows(conn)) == 1
+
+
+def test_an_unlinked_file_at_the_target_is_a_conflict_that_is_logged_and_fetches_nothing(dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    rel = "Neil Young/Harvest/01 - Song 1.flac"
+    (lib / rel).parent.mkdir(parents=True)
+    (lib / rel).write_bytes(b"placeholder")
+    add_file(conn, rel, a)  # unlinked legacy file, 9 s against Tidal's 4 s: outside the tolerance, so nothing claims it
+    conn.execute("UPDATE file SET duration_s = 9")
+    items = plan_missing(conn, scope="all")
+    assert [i.target_rel for i in items] == [rel]
+    session, http = tidal(1), FakeHttp()
+    res, out = run(conn, session, http, dirs, items=items, verify=False)
+    assert (res["placed"], res["exists"], res["conflict"], res["failed"]) == (0, 0, 1, 0)
+    assert session.calls == [] and http.urls == [] and not any(p.is_file() for p in stg.rglob("*"))
+    assert (lib / rel).read_bytes() == b"placeholder" and len(rows(conn)) == 1
+    [ev] = rows(conn, "event_log")
+    assert (ev["kind"], ev["subject"]) == ("fetch.conflict", rel) and '"tidal_track_id": 1' in ev["data_json"]
+    assert any(line.startswith("  conflict") and rel in line for line in out) and "1 conflict" in out[-1]
+
+
+def test_a_target_the_ledger_links_to_this_recording_is_exists_not_a_conflict(dirs):
+    conn, a = seed(1)
+    items = plan_missing(conn, scope="all")
+    add_file(conn, "Neil Young/Harvest/01 - Song 1.flac", a, conn.execute("SELECT id FROM recording").fetchone()[0])
+    res, _ = run(conn, tidal(1), FakeHttp(), dirs, items=items, verify=False)
+    assert (res["exists"], res["conflict"]) == (1, 0) and rows(conn, "event_log") == []
 
 
 @needs_ffmpeg
@@ -475,12 +503,12 @@ def test_dry_run_is_the_default_and_makes_no_calls_and_no_writes(flac, dirs):
     session, http, out = tidal(2), FakeHttp(default=flac), []
     before = (len(rows(conn)), len(rows(conn, "event_log")), sorted(p for p in lib.rglob("*")))
     res = fetch_items(conn, session, make_gate(), plan_missing(conn, scope="all"), stg, lib, out=out.append)
-    assert res["dry_run"] and (res["would_fetch"], res["exists"]) == (1, 1)
+    assert res["dry_run"] and (res["would_fetch"], res["exists"], res["conflict"]) == (1, 0, 1)
     assert session.calls == [] and http.urls == []
     assert not stg.exists()
     assert before == (len(rows(conn)), len(rows(conn, "event_log")), sorted(p for p in lib.rglob("*")))
     text = "\n".join(out)
-    assert "would fetch" in text and "Song 2.flac" in text and "exists, skip" in text
+    assert "would fetch" in text and "Song 2.flac" in text and "conflict" in text
 
 
 @needs_ffmpeg
@@ -517,6 +545,19 @@ def test_401_on_one_tracks_playback_blocks_that_track_and_continues(flac, dirs):
     [blocked] = [r for r in rows(conn, "event_log") if r["kind"] == "fetch.blocked"]
     assert blocked["subject"] == "1"
     assert [f["path"] for f in rows(conn)] == ["Neil Young/Harvest/02 - Song 2.flac"]
+
+
+def test_execute_output_names_each_track_owned_under_another_title_and_its_file(dirs):
+    conn, a = seed(2)
+    [song1, _] = plan_missing(conn, scope="all")
+    stg, lib = dirs
+    out: list[str] = []
+    res = fetch_items(conn, tidal(0), make_gate(), [], stg, lib, dry_run=False, out=out.append,
+                      skipped=[(song1, "Neil Young/Harvest/Old Song One.flac")])
+    text = "\n".join(out)
+    assert "Song 1" in text and "Neil Young/Harvest/Old Song One.flac" in text
+    assert "1 owned under another title" in text
+    assert res["stopped"] is None
 
 
 def test_a_401_about_the_token_stops_the_run(dirs):
@@ -650,3 +691,71 @@ def test_cli_execute_exits_3_on_429_and_persists_the_pause(cli_env, monkeypatch,
     assert not list((cli_env / "lib").rglob("*.flac"))
     monkeypatch.setattr(cli, "_login", lambda *a: pytest.fail("a paused gate must not log in"))
     assert cli.main(["fetch", "--execute", "--scope", "all"]) == cli.EXIT_PAUSED
+
+
+@needs_ffmpeg
+def test_cli_execute_exits_1_when_every_track_is_a_conflict(cli_env, monkeypatch, capsys):
+    session = FakeTidal()
+    monkeypatch.setattr(cli, "_login", lambda gate, token: session)
+    album = cli_env / "lib" / "Neil Young" / "Harvest"
+    album.mkdir(parents=True)
+    for n in (1, 2):
+        (album / f"0{n} - Song {n}.flac").write_bytes(b"not ours")  # on disk, unlinked: the target is taken
+    assert cli.main(["fetch", "--execute", "--scope", "all"]) == 1
+    cap = capsys.readouterr()
+    assert "0 placed" in cap.out and "2 conflict" in cap.out and "stopped=None" in cap.out
+    assert "2 target(s) taken" in cap.err and "exit 1" in cap.err
+    assert session.calls == []  # a taken target costs no Tidal call
+
+
+@needs_ffmpeg
+def test_a_target_taken_after_the_download_is_a_conflict_that_keeps_and_names_the_staged_copy(flac, dirs):
+    conn, a = seed(1)
+    stg, lib = dirs
+    rel = "Neil Young/Harvest/01 - Song 1.flac"
+    staged = stg / f"{STAGED1}.flac"
+
+    class RacingHttp(FakeHttp):
+        def get(self, url, **kw):
+            (lib / rel).parent.mkdir(parents=True, exist_ok=True)
+            (lib / rel).write_bytes(b"precious")  # someone else takes the path while the download runs
+            return super().get(url, **kw)
+    res, out = run(conn, tidal(1), RacingHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["conflict"], res["failed"]) == (0, 1, 0)
+    assert (lib / rel).read_bytes() == b"precious" and staged.is_file() and len(rows(conn)) == 0
+    [ev] = rows(conn, "event_log")
+    assert ev["kind"] == "fetch.conflict" and str(staged) in ev["message"] and str(staged) in ev["data_json"]
+    assert "Not fetched" not in ev["message"] and "Downloaded and verified" in ev["message"]
+    [line] = [x for x in out if x.startswith("  conflict")]
+    assert str(staged) in line and "nothing fetched" not in line
+
+
+@needs_ffmpeg
+def test_a_target_that_appears_between_the_check_and_the_link_is_a_conflict_that_names_the_staged_copy(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+    stg, lib = dirs
+    rel = "Neil Young/Harvest/01 - Song 1.flac"
+    staged = stg / f"{STAGED1}.flac"
+
+    def raced(src, dst):
+        dst.write_bytes(b"precious")  # lands after the last check, so the no-clobber link is refused
+        raise FileExistsError(errno.EEXIST, "library file already exists", str(dst))
+    monkeypatch.setattr(fetch_run, "_move_into_library", raced)
+    res, out = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["conflict"], res["failed"]) == (0, 1, 0)
+    assert (lib / rel).read_bytes() == b"precious" and staged.is_file() and rows(conn) == []
+    [ev] = rows(conn, "event_log")
+    assert ev["kind"] == "fetch.conflict" and str(staged) in ev["message"] and str(staged) in ev["data_json"]
+    [line] = [x for x in out if x.startswith("  conflict")]
+    assert str(staged) in line
+
+
+@needs_ffmpeg
+def test_a_file_exists_error_with_nothing_at_the_target_is_still_a_failure(flac, dirs, monkeypatch):
+    conn, a = seed(1)
+
+    def refused(src, dst):
+        raise FileExistsError(errno.EEXIST, "something else", str(dst))
+    monkeypatch.setattr(fetch_run, "_move_into_library", refused)
+    res, _ = run(conn, tidal(1), FakeHttp({URL.format(1): flac}), dirs)
+    assert (res["placed"], res["conflict"], res["failed"]) == (0, 0, 1)

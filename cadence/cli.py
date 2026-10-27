@@ -217,7 +217,10 @@ def cmd_fetch(args, conn) -> int:
         return EXIT_PAUSED
     if res["stopped"] == "auth":
         print("Tidal rejected our login (401). Refresh it by running tidal-dl-ng once, then re-run.", file=sys.stderr)
-    return 1 if res["stopped"] or res["failed"] else 0
+    if res["conflict"]:
+        print(f"fetch: {res['conflict']} target(s) taken by files the ledger does not link to the track: exit 1",
+              file=sys.stderr)
+    return 1 if res["stopped"] or res["failed"] or res["conflict"] else 0
 
 
 def cmd_quality(args, conn) -> int:
